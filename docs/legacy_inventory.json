@@ -1,0 +1,1569 @@
+{
+  "sha256": "f11e3de3743434f1ee8168683285dca4b54c0c00e93f77fbe25b2a4693106c37",
+  "lines": 3136,
+  "definitions": [
+    {
+      "name": "JRQueryResult",
+      "line": 207,
+      "end": 215,
+      "calls": []
+    },
+    {
+      "name": "JRCachedResult",
+      "line": 219,
+      "end": 225,
+      "calls": []
+    },
+    {
+      "name": "checkin_bot_key",
+      "line": 228,
+      "end": 230,
+      "calls": [
+        "str",
+        "str(bot_config['bot']).strip",
+        "str(bot_config['bot']).strip().casefold"
+      ]
+    },
+    {
+      "name": "migrate_last_sign_time_schema",
+      "line": 233,
+      "end": 292,
+      "calls": [
+        "CHECKIN_BOTS.values",
+        "checkin_bot_key",
+        "cur.close",
+        "cur.fetchall",
+        "db_conn.commit",
+        "db_conn.execute",
+        "db_conn.rollback",
+        "dict.fromkeys",
+        "list",
+        "logger.info",
+        "sorted"
+      ]
+    },
+    {
+      "name": "init_db",
+      "line": 295,
+      "end": 352,
+      "calls": [
+        "aiosqlite.connect",
+        "cur.fetchall",
+        "datetime.fromtimestamp",
+        "datetime.fromtimestamp(now, JR_DAILY_TIMEZONE).date",
+        "datetime.fromtimestamp(now, JR_DAILY_TIMEZONE).date().isoformat",
+        "db_conn.commit",
+        "db_conn.execute",
+        "migrate_last_sign_time_schema",
+        "time.time"
+      ]
+    },
+    {
+      "name": "close_db",
+      "line": 354,
+      "end": 358,
+      "calls": [
+        "connection.close"
+      ]
+    },
+    {
+      "name": "get_last_sign_time",
+      "line": 360,
+      "end": 368,
+      "calls": [
+        "cur.close",
+        "cur.fetchone",
+        "db_conn.execute"
+      ]
+    },
+    {
+      "name": "set_last_sign_time",
+      "line": 370,
+      "end": 376,
+      "calls": [
+        "db_conn.commit",
+        "db_conn.execute"
+      ]
+    },
+    {
+      "name": "normalize_jr_query",
+      "line": 379,
+      "end": 381,
+      "calls": [
+        "(request_text or '').strip",
+        "re.sub",
+        "re.sub('\\\\s+', ' ', (request_text or '').strip()).casefold"
+      ]
+    },
+    {
+      "name": "jr_cache_key",
+      "line": 384,
+      "end": 386,
+      "calls": [
+        "hashlib.sha256",
+        "hashlib.sha256(normalized.encode('utf-8')).hexdigest",
+        "normalize_jr_query",
+        "normalized.encode"
+      ]
+    },
+    {
+      "name": "get_jr_query_lock",
+      "line": 389,
+      "end": 396,
+      "calls": [
+        "asyncio.Lock",
+        "jr_cache_key",
+        "jr_query_locks.get"
+      ]
+    },
+    {
+      "name": "hold_jr_query_lock",
+      "line": 400,
+      "end": 419,
+      "calls": [
+        "get_jr_query_lock",
+        "jr_cache_key",
+        "jr_query_lock_users.get",
+        "jr_query_lock_users.pop",
+        "jr_query_locks.get",
+        "jr_query_locks.pop",
+        "lock.acquire",
+        "lock.release"
+      ]
+    },
+    {
+      "name": "_is_path_in_jr_cache",
+      "line": 422,
+      "end": 427,
+      "calls": [
+        "JR_CACHE_FILES_DIR.resolve",
+        "path.resolve",
+        "path.resolve().relative_to"
+      ]
+    },
+    {
+      "name": "remove_jr_cached_file",
+      "line": 430,
+      "end": 445,
+      "calls": [
+        "Path",
+        "_is_path_in_jr_cache",
+        "logger.warning",
+        "path.parent.rmdir",
+        "path.unlink"
+      ]
+    },
+    {
+      "name": "cleanup_orphan_jr_cache_files",
+      "line": 448,
+      "end": 469,
+      "calls": [
+        "JR_CACHE_FILES_DIR.exists",
+        "JR_CACHE_FILES_DIR.rglob",
+        "Path",
+        "Path(path).resolve",
+        "_is_path_in_jr_cache",
+        "logger.warning",
+        "path.is_file",
+        "path.resolve",
+        "path.stat",
+        "remove_jr_cached_file",
+        "str",
+        "time.time"
+      ]
+    },
+    {
+      "name": "get_jr_cached_result",
+      "line": 472,
+      "end": 496,
+      "calls": [
+        "JRCachedResult",
+        "cur.close",
+        "cur.fetchone",
+        "db_conn.execute",
+        "float",
+        "jr_cache_key",
+        "time.time"
+      ]
+    },
+    {
+      "name": "set_jr_cached_result",
+      "line": 499,
+      "end": 535,
+      "calls": [
+        "ValueError",
+        "cur.fetchone",
+        "db_conn.commit",
+        "db_conn.execute",
+        "jr_cache_key",
+        "remove_jr_cached_file",
+        "time.time"
+      ]
+    },
+    {
+      "name": "purge_expired_jr_cache",
+      "line": 538,
+      "end": 569,
+      "calls": [
+        "active_cur.fetchall",
+        "cleanup_orphan_jr_cache_files",
+        "datetime.fromtimestamp",
+        "datetime.fromtimestamp(now, JR_DAILY_TIMEZONE).date",
+        "datetime.fromtimestamp(now, JR_DAILY_TIMEZONE).date().isoformat",
+        "db_conn.commit",
+        "db_conn.execute",
+        "logger.info",
+        "max",
+        "path_cur.fetchall",
+        "remove_jr_cached_file",
+        "time.time"
+      ]
+    },
+    {
+      "name": "get_jr_membership",
+      "line": 572,
+      "end": 581,
+      "calls": [
+        "cur.fetchone",
+        "db_conn.execute",
+        "float"
+      ]
+    },
+    {
+      "name": "set_jr_membership",
+      "line": 584,
+      "end": 593,
+      "calls": [
+        "ValueError",
+        "db_conn.commit",
+        "db_conn.execute",
+        "time.time"
+      ]
+    },
+    {
+      "name": "jr_usage_date",
+      "line": 596,
+      "end": 598,
+      "calls": [
+        "datetime.fromtimestamp",
+        "datetime.fromtimestamp(ts, JR_DAILY_TIMEZONE).date",
+        "datetime.fromtimestamp(ts, JR_DAILY_TIMEZONE).date().isoformat",
+        "time.time"
+      ]
+    },
+    {
+      "name": "get_jr_daily_usage",
+      "line": 601,
+      "end": 609,
+      "calls": [
+        "cur.fetchone",
+        "db_conn.execute",
+        "int",
+        "jr_usage_date"
+      ]
+    },
+    {
+      "name": "increment_jr_daily_usage",
+      "line": 612,
+      "end": 621,
+      "calls": [
+        "db_conn.commit",
+        "db_conn.execute",
+        "jr_usage_date"
+      ]
+    },
+    {
+      "name": "get_jr_account_state_snapshot",
+      "line": 624,
+      "end": 654,
+      "calls": [
+        "','.join",
+        "db_conn.execute",
+        "dict.fromkeys",
+        "float",
+        "int",
+        "jr_usage_date",
+        "list",
+        "membership_cur.close",
+        "membership_cur.fetchall",
+        "str",
+        "usage_cur.close",
+        "usage_cur.fetchall"
+      ]
+    },
+    {
+      "name": "is_user_banned",
+      "line": 657,
+      "end": 664,
+      "calls": [
+        "cur.fetchone",
+        "db_conn.execute",
+        "int"
+      ]
+    },
+    {
+      "name": "unban_user",
+      "line": 667,
+      "end": 674,
+      "calls": [
+        "db_conn.commit",
+        "db_conn.execute",
+        "int"
+      ]
+    },
+    {
+      "name": "get_phone",
+      "line": 677,
+      "end": 679,
+      "calls": [
+        "Path",
+        "str"
+      ]
+    },
+    {
+      "name": "get_client_lock",
+      "line": 681,
+      "end": 685,
+      "calls": [
+        "asyncio.Lock",
+        "get_phone"
+      ]
+    },
+    {
+      "name": "reply_long",
+      "line": 687,
+      "end": 705,
+      "calls": [
+        "''.join",
+        "chunks.append",
+        "current.append",
+        "len",
+        "text.splitlines",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "reply_text_retry",
+      "line": 708,
+      "end": 716,
+      "calls": [
+        "asyncio.sleep",
+        "message.reply_text",
+        "range"
+      ]
+    },
+    {
+      "name": "require_admin",
+      "line": 719,
+      "end": 726,
+      "calls": [
+        "reply_text_retry"
+      ]
+    },
+    {
+      "name": "banned_command_guard",
+      "line": 729,
+      "end": 740,
+      "calls": [
+        "is_user_banned",
+        "reply_text_retry"
+      ]
+    },
+    {
+      "name": "load_clients",
+      "line": 744,
+      "end": 764,
+      "calls": [
+        "Path",
+        "TelegramClient",
+        "loaded.append",
+        "logger.exception",
+        "logger.info",
+        "logger.warning",
+        "phone.isdigit",
+        "session_dir.glob",
+        "session_dir.mkdir",
+        "session_path.stem.strip",
+        "sorted",
+        "str"
+      ]
+    },
+    {
+      "name": "start_all_clients",
+      "line": 766,
+      "end": 797,
+      "calls": [
+        "asyncio.gather",
+        "client.disconnect",
+        "client.get_me",
+        "client.start",
+        "get_client_lock",
+        "get_phone",
+        "getattr",
+        "isinstance",
+        "logger.error",
+        "logger.exception",
+        "logger.info",
+        "start_one",
+        "type"
+      ]
+    },
+    {
+      "name": "build_ad_available_clients",
+      "line": 799,
+      "end": 806,
+      "calls": [
+        "len",
+        "logger.info",
+        "os.path.basename",
+        "os.path.basename(c.session.filename).replace"
+      ]
+    },
+    {
+      "name": "do_checkin",
+      "line": 809,
+      "end": 888,
+      "calls": [
+        "_wait_for_bot_reply",
+        "any",
+        "asyncio.sleep",
+        "bot_config.get",
+        "client.get_messages",
+        "client.send_message",
+        "enumerate",
+        "logger.exception",
+        "logger.warning",
+        "msgs[0].click",
+        "range"
+      ]
+    },
+    {
+      "name": "query_balance",
+      "line": 890,
+      "end": 969,
+      "calls": [
+        "_wait_for_bot_reply",
+        "asyncio.sleep",
+        "bot_config.get",
+        "btn_msg.click",
+        "client.get_messages",
+        "client.send_message",
+        "enumerate",
+        "logger.exception",
+        "logger.info",
+        "match.group",
+        "pattern.search",
+        "re.compile",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "_wait_for_bot_reply",
+      "line": 971,
+      "end": 985,
+      "calls": [
+        "asyncio.sleep",
+        "check_func",
+        "client.get_messages",
+        "logger.warning",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "auto_checkin_scheduler",
+      "line": 987,
+      "end": 1043,
+      "calls": [
+        "asyncio.sleep",
+        "checkin_bot_key",
+        "client.connect",
+        "client.is_connected",
+        "datetime.fromtimestamp",
+        "do_checkin",
+        "get_client_lock",
+        "get_last_sign_time",
+        "get_phone",
+        "logger.error",
+        "logger.exception",
+        "logger.info",
+        "logger.warning",
+        "max",
+        "min",
+        "random.uniform",
+        "set_last_sign_time",
+        "time.time"
+      ]
+    },
+    {
+      "name": "get_next_ad_client",
+      "line": 1046,
+      "end": 1058,
+      "calls": [
+        "ad_client_cooldowns.get",
+        "get_phone",
+        "len",
+        "range",
+        "time.time"
+      ]
+    },
+    {
+      "name": "wait_for_next_ad_client",
+      "line": 1061,
+      "end": 1085,
+      "calls": [
+        "ad_client_cooldowns.get",
+        "ad_stop_event.is_set",
+        "ad_stop_event.wait",
+        "asyncio.wait_for",
+        "get_next_ad_client",
+        "get_phone",
+        "logger.info",
+        "max",
+        "min",
+        "time.time"
+      ]
+    },
+    {
+      "name": "parse_tg_link",
+      "line": 1087,
+      "end": 1091,
+      "calls": [
+        "int",
+        "match.group",
+        "re.search"
+      ]
+    },
+    {
+      "name": "ad_loop",
+      "line": 1093,
+      "end": 1194,
+      "calls": [
+        "ad_stop_event.is_set",
+        "ad_stop_event.wait",
+        "asyncio.wait_for",
+        "client.connect",
+        "client.forward_messages",
+        "client.get_entity",
+        "client.get_messages",
+        "client.is_connected",
+        "client.send_message",
+        "get_phone",
+        "logger.error",
+        "logger.info",
+        "logger.warning",
+        "parse_tg_link",
+        "random.uniform",
+        "time.time",
+        "wait_for_next_ad_client"
+      ]
+    },
+    {
+      "name": "target_message_signature",
+      "line": 1197,
+      "end": 1206,
+      "calls": [
+        "buttons.append",
+        "getattr",
+        "str",
+        "tuple"
+      ]
+    },
+    {
+      "name": "is_verify_success",
+      "line": 1209,
+      "end": 1211,
+      "calls": [
+        "(getattr(message, 'text', None) or '').strip",
+        "getattr"
+      ]
+    },
+    {
+      "name": "is_jr_pending_message",
+      "line": 1214,
+      "end": 1217,
+      "calls": [
+        "(getattr(message, 'text', None) or '').strip",
+        "any",
+        "bool",
+        "getattr"
+      ]
+    },
+    {
+      "name": "wait_jr_ready_reply",
+      "line": 1220,
+      "end": 1275,
+      "calls": [
+        "asyncio.sleep",
+        "client.get_messages",
+        "get_phone",
+        "is_jr_pending_message",
+        "is_verification_message",
+        "logger.info",
+        "logger.warning",
+        "pending_ids.add",
+        "set",
+        "sorted",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "wait_target_after_click",
+      "line": 1278,
+      "end": 1300,
+      "calls": [
+        "asyncio.sleep",
+        "client.get_messages",
+        "logger.warning",
+        "target_message_signature",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "normalize_ocr_text",
+      "line": 1303,
+      "end": 1309,
+      "calls": [
+        "''.join",
+        "''.join((ch for ch in normalized if ch.isalnum() or '一' <= ch <= '鿿')).lower",
+        "ch.isalnum",
+        "unicodedata.normalize"
+      ]
+    },
+    {
+      "name": "extract_ocr_candidates",
+      "line": 1312,
+      "end": 1324,
+      "calls": [
+        "(getattr(button, 'text', None) or '').strip",
+        "any",
+        "candidates.append",
+        "enumerate",
+        "getattr",
+        "normalize_ocr_text"
+      ]
+    },
+    {
+      "name": "_pil_to_png_bytes",
+      "line": 1327,
+      "end": 1330,
+      "calls": [
+        "BytesIO",
+        "image.save",
+        "output.getvalue"
+      ]
+    },
+    {
+      "name": "_classification_with_confidence",
+      "line": 1333,
+      "end": 1369,
+      "calls": [
+        "''.join",
+        "float",
+        "isinstance",
+        "len",
+        "max",
+        "ocr_engine.classification",
+        "range",
+        "recognized.append",
+        "result.get",
+        "scores.append",
+        "str",
+        "sum"
+      ]
+    },
+    {
+      "name": "_recognize_captcha_sync",
+      "line": 1372,
+      "end": 1455,
+      "calls": [
+        "BytesIO",
+        "Image.new",
+        "Image.open",
+        "ImageOps.autocontrast",
+        "ImageOps.grayscale",
+        "ImageOps.invert",
+        "ImageOps.invert(red_mask).getbbox",
+        "RuntimeError",
+        "_classification_with_confidence",
+        "_pil_to_png_bytes",
+        "ddddocr.DdddOcr",
+        "image.crop",
+        "instruction.getdata",
+        "int",
+        "len",
+        "max",
+        "min",
+        "ocr_engine.classification",
+        "ocr_engine.set_ranges",
+        "re.findall",
+        "red_mask.crop",
+        "red_mask.putdata",
+        "set",
+        "source.convert",
+        "str",
+        "word_crop.point"
+      ]
+    },
+    {
+      "name": "recognize_captcha",
+      "line": 1458,
+      "end": 1476,
+      "calls": [
+        "ThreadPoolExecutor",
+        "asyncio.get_running_loop",
+        "loop.run_in_executor"
+      ]
+    },
+    {
+      "name": "choose_ocr_button",
+      "line": 1479,
+      "end": 1530,
+      "calls": [
+        "''.join",
+        "'、'.join",
+        "RuntimeError",
+        "client.download_media",
+        "dict.fromkeys",
+        "extract_ocr_candidates",
+        "get_phone",
+        "getattr",
+        "len",
+        "logger.info",
+        "normalize_ocr_text",
+        "recognize_captcha"
+      ]
+    },
+    {
+      "name": "solve_verification_with_ocr",
+      "line": 1533,
+      "end": 1598,
+      "calls": [
+        "(getattr(callback_answer, 'message', None) or '').strip",
+        "RuntimeError",
+        "TimeoutError",
+        "choose_ocr_button",
+        "client.send_message",
+        "current.click",
+        "get_phone",
+        "getattr",
+        "is_verification_message",
+        "is_verify_success",
+        "logger.info",
+        "logger.warning",
+        "range",
+        "target_message_signature",
+        "wait_jr_ready_reply",
+        "wait_target_after_click"
+      ]
+    },
+    {
+      "name": "jr_cache_cleanup_loop",
+      "line": 1601,
+      "end": 1611,
+      "calls": [
+        "asyncio.sleep",
+        "logger.exception",
+        "logger.info",
+        "purge_expired_jr_cache"
+      ]
+    },
+    {
+      "name": "_button_text",
+      "line": 1619,
+      "end": 1620,
+      "calls": [
+        "(getattr(button, 'text', None) or '').strip",
+        "getattr"
+      ]
+    },
+    {
+      "name": "is_verification_message",
+      "line": 1622,
+      "end": 1652,
+      "calls": [
+        "(getattr(message, 'text', None) or '').strip",
+        "_button_text",
+        "any",
+        "getattr"
+      ]
+    },
+    {
+      "name": "find_button",
+      "line": 1655,
+      "end": 1663,
+      "calls": [
+        "_button_text",
+        "any",
+        "enumerate",
+        "getattr"
+      ]
+    },
+    {
+      "name": "find_export_button",
+      "line": 1666,
+      "end": 1668,
+      "calls": [
+        "find_button"
+      ]
+    },
+    {
+      "name": "get_callback_answer_text",
+      "line": 1671,
+      "end": 1672,
+      "calls": [
+        "(getattr(answer, 'message', None) or '').strip",
+        "getattr"
+      ]
+    },
+    {
+      "name": "is_free_export_feedback",
+      "line": 1675,
+      "end": 1676,
+      "calls": [
+        "any"
+      ]
+    },
+    {
+      "name": "is_jr_export_file_message",
+      "line": 1679,
+      "end": 1687,
+      "calls": [
+        "bool",
+        "getattr"
+      ]
+    },
+    {
+      "name": "jr_message_reply_to_id",
+      "line": 1690,
+      "end": 1696,
+      "calls": [
+        "getattr",
+        "int"
+      ]
+    },
+    {
+      "name": "jr_message_matches_export_request",
+      "line": 1699,
+      "end": 1719,
+      "calls": [
+        "getattr",
+        "int",
+        "is_jr_export_file_message",
+        "jr_message_reply_to_id"
+      ]
+    },
+    {
+      "name": "jr_original_file_name",
+      "line": 1722,
+      "end": 1727,
+      "calls": [
+        "(getattr(file_obj, 'name', None) or '').strip",
+        "getattr",
+        "re.split",
+        "re.split('[\\\\\\\\/]', raw_name)[-1].strip"
+      ]
+    },
+    {
+      "name": "download_jr_export_file",
+      "line": 1730,
+      "end": 1750,
+      "calls": [
+        "FileNotFoundError",
+        "Path",
+        "actual_path.is_file",
+        "actual_path.resolve",
+        "client.download_media",
+        "jr_original_file_name",
+        "re.sub",
+        "remove_jr_cached_file",
+        "storage_name.rstrip",
+        "str",
+        "target_dir.mkdir",
+        "target_dir.rmdir",
+        "uuid.uuid4"
+      ]
+    },
+    {
+      "name": "detect_jr_membership",
+      "line": 1753,
+      "end": 1773,
+      "calls": [
+        "get_jr_membership",
+        "get_phone",
+        "logger.info",
+        "set_jr_membership"
+      ]
+    },
+    {
+      "name": "try_jr_export_file",
+      "line": 1776,
+      "end": 1890,
+      "calls": [
+        "(getattr(candidate, 'text', None) or '').strip",
+        "JRQueryResult",
+        "any",
+        "asyncio.sleep",
+        "client.get_entity",
+        "client.get_messages",
+        "download_jr_export_file",
+        "find_export_button",
+        "get_callback_answer_text",
+        "get_phone",
+        "getattr",
+        "int",
+        "is_free_export_feedback",
+        "jr_message_matches_export_request",
+        "logger.info",
+        "logger.warning",
+        "max",
+        "message.click",
+        "sorted",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "find_buy_button",
+      "line": 1893,
+      "end": 1916,
+      "calls": [
+        "_button_text",
+        "any",
+        "enumerate",
+        "getattr",
+        "int",
+        "re.findall"
+      ]
+    },
+    {
+      "name": "find_next_page_button",
+      "line": 1919,
+      "end": 1932,
+      "calls": [
+        "_button_text",
+        "enumerate",
+        "find_button",
+        "getattr"
+      ]
+    },
+    {
+      "name": "parse_page_info",
+      "line": 1935,
+      "end": 1944,
+      "calls": [
+        "JR_PAGE_RE.search",
+        "getattr",
+        "int",
+        "match.group"
+      ]
+    },
+    {
+      "name": "clean_page_text",
+      "line": 1947,
+      "end": 1949,
+      "calls": [
+        "(getattr(message, 'text', None) or '').strip",
+        "JR_PAGE_RE.sub",
+        "JR_PAGE_RE.sub('', text, count=1).strip",
+        "getattr"
+      ]
+    },
+    {
+      "name": "page_content_signature",
+      "line": 1952,
+      "end": 1963,
+      "calls": [
+        "(getattr(message, 'text', None) or '').strip",
+        "_button_text",
+        "getattr",
+        "parse_page_info",
+        "tuple"
+      ]
+    },
+    {
+      "name": "wait_message_change",
+      "line": 1966,
+      "end": 2019,
+      "calls": [
+        "asyncio.sleep",
+        "client.get_messages",
+        "is_jr_pending_message",
+        "logger.warning",
+        "sorted",
+        "target_message_signature",
+        "time.monotonic"
+      ]
+    },
+    {
+      "name": "fetch_all_paged_data",
+      "line": 2022,
+      "end": 2142,
+      "calls": [
+        "'\\n\\n'.join",
+        "'\\n\\n'.join((pages[i] for i in sorted(pages) if pages[i])).strip",
+        "(getattr(changed, 'text', None) or '').strip",
+        "(getattr(current, 'text', None) or '').strip",
+        "RuntimeError",
+        "TimeoutError",
+        "asyncio.sleep",
+        "clean_page_text",
+        "current.click",
+        "find_next_page_button",
+        "get_phone",
+        "getattr",
+        "len",
+        "logger.info",
+        "logger.warning",
+        "page_content_signature",
+        "parse_page_info",
+        "range",
+        "set",
+        "sorted",
+        "target_message_signature",
+        "visited_content.add",
+        "visited_pages.add",
+        "wait_message_change"
+      ]
+    },
+    {
+      "name": "click_buy_and_fetch_all",
+      "line": 2145,
+      "end": 2201,
+      "calls": [
+        "(getattr(result_message, 'text', None) or '').strip",
+        "JRQueryResult",
+        "TimeoutError",
+        "asyncio.sleep",
+        "fetch_all_paged_data",
+        "find_buy_button",
+        "find_next_page_button",
+        "get_phone",
+        "getattr",
+        "logger.info",
+        "logger.warning",
+        "message.click",
+        "parse_page_info",
+        "target_message_signature",
+        "try_jr_export_file",
+        "wait_message_change"
+      ]
+    },
+    {
+      "name": "strip_backticks",
+      "line": 2211,
+      "end": 2213,
+      "calls": [
+        "(text or '').replace"
+      ]
+    },
+    {
+      "name": "normalize_jr_full_result",
+      "line": 2216,
+      "end": 2255,
+      "calls": [
+        "'\\n'.join",
+        "'\\n'.join(output).strip",
+        "JR_TOTAL_HEADER_RE.match",
+        "line.strip",
+        "output.append",
+        "output.pop",
+        "output[-1].strip",
+        "raw_line.rstrip",
+        "strip_backticks",
+        "text.splitlines"
+      ]
+    },
+    {
+      "name": "split_text_by_lines",
+      "line": 2258,
+      "end": 2296,
+      "calls": [
+        "chunks.append",
+        "len",
+        "text.splitlines"
+      ]
+    },
+    {
+      "name": "send_long_text_to_admin",
+      "line": 2299,
+      "end": 2337,
+      "calls": [
+        "bot_app.bot.send_message",
+        "enumerate",
+        "len",
+        "normalize_jr_full_result",
+        "split_text_by_lines"
+      ]
+    },
+    {
+      "name": "send_jr_file_to_admin",
+      "line": 2340,
+      "end": 2350,
+      "calls": [
+        "FileNotFoundError",
+        "Path",
+        "bot_app.bot.send_document",
+        "path.is_file",
+        "path.open"
+      ]
+    },
+    {
+      "name": "parse_balance_number",
+      "line": 2354,
+      "end": 2364,
+      "calls": [
+        "float",
+        "isinstance",
+        "match.group",
+        "re.search"
+      ]
+    },
+    {
+      "name": "rank_jr_clients_by_balance",
+      "line": 2367,
+      "end": 2412,
+      "calls": [
+        "asyncio.gather",
+        "get_client_lock",
+        "get_jr_account_state_snapshot",
+        "get_phone",
+        "logger.exception",
+        "logger.info",
+        "logger.warning",
+        "memberships.get",
+        "parse_balance_number",
+        "query_balance",
+        "query_one",
+        "ranked.sort",
+        "usages.get"
+      ]
+    },
+    {
+      "name": "record_jr_query_success",
+      "line": 2415,
+      "end": 2445,
+      "calls": [
+        "detect_jr_membership",
+        "get_phone",
+        "increment_jr_daily_usage",
+        "logger.info",
+        "logger.warning",
+        "set_jr_cached_result"
+      ]
+    },
+    {
+      "name": "jr_try_client",
+      "line": 2448,
+      "end": 2510,
+      "calls": [
+        "click_buy_and_fetch_all",
+        "client.send_message",
+        "get_client_lock",
+        "get_phone",
+        "is_verification_message",
+        "logger.exception",
+        "logger.info",
+        "record_jr_query_success",
+        "send_jr_file_to_admin",
+        "send_long_text_to_admin",
+        "solve_verification_with_ocr",
+        "type",
+        "wait_jr_ready_reply",
+        "{'member': '会员', 'free': '免费', 'unknown': '待识别'}.get"
+      ]
+    },
+    {
+      "name": "run_jr_query",
+      "line": 2512,
+      "end": 2531,
+      "calls": [
+        "(request_text or '').strip",
+        "hold_jr_query_lock",
+        "run_jr_query_locked",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "run_jr_query_locked",
+      "line": 2534,
+      "end": 2640,
+      "calls": [
+        "'\\n'.join",
+        "'，'.join",
+        "Path",
+        "failures.append",
+        "get_jr_cached_result",
+        "get_phone",
+        "int",
+        "jr_try_client",
+        "logger.exception",
+        "logger.info",
+        "logger.warning",
+        "max",
+        "membership_labels.get",
+        "rank_jr_clients_by_balance",
+        "send_jr_file_to_admin",
+        "send_long_text_to_admin",
+        "status_msg.delete",
+        "status_msg.edit_text",
+        "time.time",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "jr_command",
+      "line": 2643,
+      "end": 2648,
+      "calls": [
+        "' '.join",
+        "' '.join(context.args).strip",
+        "require_admin",
+        "run_jr_query"
+      ]
+    },
+    {
+      "name": "jr_plus_handler",
+      "line": 2651,
+      "end": 2666,
+      "calls": [
+        "match.group",
+        "match.group(1).strip",
+        "re.match",
+        "require_admin",
+        "run_jr_query",
+        "update.message.text.strip"
+      ]
+    },
+    {
+      "name": "start_command",
+      "line": 2671,
+      "end": 2697,
+      "calls": [
+        "is_user_banned",
+        "reply_text_retry"
+      ]
+    },
+    {
+      "name": "help_command",
+      "line": 2700,
+      "end": 2702,
+      "calls": [
+        "start_command"
+      ]
+    },
+    {
+      "name": "unban_command",
+      "line": 2705,
+      "end": 2717,
+      "calls": [
+        "context.args[0].isdigit",
+        "int",
+        "len",
+        "logger.info",
+        "reply_text_retry",
+        "require_admin",
+        "unban_user"
+      ]
+    },
+    {
+      "name": "qd_command",
+      "line": 2719,
+      "end": 2757,
+      "calls": [
+        "'\\n'.join",
+        "'\\n\\n'.join",
+        "CHECKIN_BOTS.items",
+        "asyncio.gather",
+        "asyncio.sleep",
+        "checkin_bot_key",
+        "do_checkin",
+        "enumerate",
+        "get_client_lock",
+        "get_phone",
+        "isinstance",
+        "len",
+        "lines.append",
+        "logger.error",
+        "min",
+        "random.uniform",
+        "reply_long",
+        "require_admin",
+        "res.items",
+        "res.values",
+        "set_last_sign_time",
+        "sign_client",
+        "time.time",
+        "type",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "jf_command",
+      "line": 2759,
+      "end": 2795,
+      "calls": [
+        "'\\n'.join",
+        "'\\n\\n'.join",
+        "asyncio.gather",
+        "balance_bots.keys",
+        "balance_bots.values",
+        "clean.append",
+        "dict",
+        "get_client_lock",
+        "get_phone",
+        "isinstance",
+        "len",
+        "lines.append",
+        "logger.error",
+        "query_balance",
+        "query_client",
+        "reply_long",
+        "require_admin",
+        "res.items",
+        "res.values",
+        "type",
+        "update.message.reply_text",
+        "value.startswith",
+        "zip"
+      ]
+    },
+    {
+      "name": "status_command",
+      "line": 2797,
+      "end": 2826,
+      "calls": [
+        "'\\n'.join",
+        "ad_client_cooldowns.get",
+        "client.is_connected",
+        "client.is_user_authorized",
+        "client_status.get",
+        "get_phone",
+        "int",
+        "len",
+        "lines.append",
+        "reply_long",
+        "require_admin",
+        "time.time"
+      ]
+    },
+    {
+      "name": "dg_command",
+      "line": 2828,
+      "end": 2847,
+      "calls": [
+        "ad_stop_event.clear",
+        "float",
+        "len",
+        "require_admin",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "tz_command",
+      "line": 2849,
+      "end": 2874,
+      "calls": [
+        "ad_stop_event.set",
+        "asyncio.gather",
+        "asyncio.shield",
+        "asyncio.wait_for",
+        "require_admin",
+        "task.cancel",
+        "task.cancelled",
+        "task.done",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "ad_content_handler",
+      "line": 2876,
+      "end": 2890,
+      "calls": [
+        "ad_loop",
+        "asyncio.create_task",
+        "update.message.reply_text"
+      ]
+    },
+    {
+      "name": "error_handler",
+      "line": 2892,
+      "end": 2893,
+      "calls": [
+        "logger.error"
+      ]
+    },
+    {
+      "name": "configure_bot_command_menus",
+      "line": 2896,
+      "end": 2952,
+      "calls": [
+        "', '.join",
+        "BotCommand",
+        "BotCommandScopeAllChatAdministrators",
+        "BotCommandScopeAllGroupChats",
+        "BotCommandScopeAllPrivateChats",
+        "BotCommandScopeChat",
+        "BotCommandScopeDefault",
+        "RuntimeError",
+        "asyncio.sleep",
+        "bot_app.bot.delete_my_commands",
+        "bot_app.bot.set_my_commands",
+        "len",
+        "list",
+        "logger.info",
+        "range"
+      ]
+    },
+    {
+      "name": "cancel_background_tasks",
+      "line": 2955,
+      "end": 2968,
+      "calls": [
+        "asyncio.gather",
+        "dict.fromkeys",
+        "isinstance",
+        "list",
+        "logger.error",
+        "task.cancel",
+        "task.done"
+      ]
+    },
+    {
+      "name": "cleanup_bot_application",
+      "line": 2971,
+      "end": 3011,
+      "calls": [
+        "application.bot.shutdown",
+        "application.shutdown",
+        "application.stop",
+        "bool",
+        "getattr",
+        "logger.warning",
+        "updater.shutdown",
+        "updater.stop"
+      ]
+    },
+    {
+      "name": "main",
+      "line": 3014,
+      "end": 3133,
+      "calls": [
+        "Application.builder",
+        "Application.builder().token",
+        "Application.builder().token(BOT_TOKEN).connect_timeout",
+        "Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout",
+        "Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout",
+        "Application.builder().token(BOT_TOKEN).connect_timeout(30).read_timeout(30).write_timeout(30).build",
+        "CHECKIN_BOTS.items",
+        "CommandHandler",
+        "MessageHandler",
+        "ad_available_clients.clear",
+        "ad_client_cooldowns.clear",
+        "ad_stop_event.set",
+        "asyncio.create_task",
+        "asyncio.gather",
+        "auto_checkin_scheduler",
+        "auto_checkin_tasks.append",
+        "auto_checkin_tasks.clear",
+        "bot_app.add_error_handler",
+        "bot_app.add_handler",
+        "bot_app.initialize",
+        "bot_app.start",
+        "bot_app.updater.start_polling",
+        "build_ad_available_clients",
+        "cancel_background_tasks",
+        "cleanup_bot_application",
+        "client.disconnect",
+        "client_locks.clear",
+        "close_db",
+        "command_handlers.items",
+        "command_handlers.keys",
+        "configure_bot_command_menus",
+        "filters.Regex",
+        "get_phone",
+        "init_db",
+        "jr_cache_cleanup_loop",
+        "jr_query_lock_users.clear",
+        "jr_query_locks.clear",
+        "load_clients",
+        "logger.error",
+        "logger.info",
+        "logger.warning",
+        "ocr_executor.shutdown",
+        "start_all_clients"
+      ]
+    }
+  ],
+  "global_names": [
+    "ADMIN_ID",
+    "AD_EXCLUDE_PHONES",
+    "AD_GROUPS",
+    "AD_INTERVAL",
+    "AD_INTERVAL_DEFAULT",
+    "API_HASH",
+    "API_ID",
+    "BOT_TOKEN",
+    "CHECKIN_BOTS",
+    "DB_FILE",
+    "DEFAULT_REPLY_TIMEOUT",
+    "JR_BALANCE_CONCURRENCY",
+    "JR_BUY_AMOUNTS",
+    "JR_BUY_KEYWORDS",
+    "JR_CACHE_CLEANUP_INTERVAL",
+    "JR_CACHE_FILES_DIR",
+    "JR_DAILY_TIMEZONE",
+    "JR_EXPORT_FILE_TIMEOUT",
+    "JR_EXPORT_KEYWORDS",
+    "JR_EXPORT_REPLY_TIMEOUT",
+    "JR_EXPORT_SUCCESS_KEYWORDS",
+    "JR_FREE_DAILY_LIMIT",
+    "JR_FREE_EXPORT_KEYWORDS",
+    "JR_MAX_PAGES",
+    "JR_MEMBERSHIP_RECHECK_INTERVAL",
+    "JR_NEXT_PAGE_KEYWORDS",
+    "JR_PAGE_INTERVAL",
+    "JR_PAGE_RE",
+    "JR_PAGE_TIMEOUT",
+    "JR_PENDING_KEYWORDS",
+    "JR_RESULT_CACHE_TTL",
+    "JR_TOTAL_HEADER_RE",
+    "JR_VERIFY_KEYWORDS",
+    "LOG_FILE",
+    "MAX_CONCURRENT_CLIENT_OPS",
+    "MIN_INTERVAL",
+    "OCR_IGNORE_BUTTON_KEYWORDS",
+    "OCR_MAX_ATTEMPTS",
+    "OCR_MIN_CONFIDENCE",
+    "RANDOM_OFFSET_MAX",
+    "SESSIONS_DIR",
+    "TARGET_AFTER_CLICK_TIMEOUT",
+    "TARGET_BOT",
+    "TARGET_FIRST_REPLY_TIMEOUT",
+    "TARGET_POLL_INTERVAL",
+    "ad_available_clients",
+    "ad_client_cooldowns",
+    "ad_client_counter",
+    "ad_content_entities",
+    "ad_content_text",
+    "ad_running",
+    "ad_stop_event",
+    "ad_task",
+    "ad_waiting_content",
+    "auto_checkin_tasks",
+    "bot_app",
+    "client_locks",
+    "client_op_semaphore",
+    "client_start_semaphore",
+    "client_status",
+    "clients",
+    "db_conn",
+    "db_lock",
+    "handler",
+    "jr_balance_semaphore",
+    "jr_cache_cleanup_task",
+    "jr_query_lock_users",
+    "jr_query_locks",
+    "logger",
+    "ocr_engine",
+    "ocr_executor"
+  ]
+}

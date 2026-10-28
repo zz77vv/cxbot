@@ -1,0 +1,5 @@
+Telethon==1.42.0
+python-telegram-bot==22.5
+aiosqlite==0.21.0
+Pillow==11.3.0
+ddddocr==1.5.6
