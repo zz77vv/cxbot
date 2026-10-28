@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+import logging
 from dataclasses import dataclass, field
 from collections import deque
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
@@ -84,6 +85,8 @@ class LoginService:
                 await self._drop(user)
                 raise
             except Exception as error:
+                logging.getLogger(__name__).warning('Login failed phase=%s error_type=%s',
+                    attempt.phase, type(error).__name__)
                 reasons = {
                     'PhoneCodeInvalidError': '验证码错误',
                     'PhoneCodeExpiredError': '验证码已过期',
@@ -92,8 +95,14 @@ class LoginService:
                     'PhoneNumberBannedError': '该号码被 Telegram 限制',
                     'TimeoutError': '连接或流程超时，外部登录结果需核实',
                     'FileExistsError': 'Session 已存在，未覆盖',
+                    'ApiIdInvalidError': 'API_ID 与 API_HASH 无效或不匹配，请在服务器本地核对',
+                    'PhoneNumberFloodError': '该号码登录请求过多，请停止重试并等待 Telegram 限制解除',
+                    'AuthRestartError': 'Telegram 要求重新开始授权，请先停止当前尝试',
+                    'ConnectionError': '连接 Telegram 失败',
                 }
                 reason = reasons.get(type(error).__name__, '当前步骤的格式、连接、保存或授权验证失败')
+                if isinstance(error, ValueError) and attempt.phase == 'phone' and attempt.client is None:
+                    reason = '手机号格式无效，请使用加号和国际区号加数字，不含空格或其他字符'
                 await self._drop(user)
                 return f'登录未完成：{reason}，已退出。请重新 /login。若已保存 Session，可通过 /status 或重启核实。'
             finally:

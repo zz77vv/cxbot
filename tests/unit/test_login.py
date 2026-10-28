@@ -155,6 +155,26 @@ async def test_sensitive_error_not_logged(login,cfg,caplog):
     client.sign_in.side_effect=ValueError('test-only-credential')
     reply=await service.submit(cfg.admin_id,cfg.admin_id,True,'test-only-credential')
     assert 'test-only-credential' not in reply+caplog.text
+    assert 'phase=code error_type=ValueError' in caplog.text
+
+
+async def test_phone_stage_diagnostics_without_payload(login,cfg,caplog):
+    service,client,manager,_=login
+    await service.begin(cfg.admin_id,cfg.admin_id,True)
+    reply=await service.submit(cfg.admin_id,cfg.admin_id,True,'not-a-phone-secret')
+    assert '手机号格式无效' in reply
+    assert 'phase=phone error_type=ValueError' in caplog.text
+    assert 'not-a-phone-secret' not in caplog.text+reply
+
+
+async def test_invalid_api_pair_diagnostic(login,cfg,caplog):
+    from telethon.errors import ApiIdInvalidError
+    service,client,manager,_=login
+    client.send_code_request.side_effect=ApiIdInvalidError(None)
+    reply=await start_phone(service,cfg)
+    assert '不匹配' in reply
+    assert 'phase=phone error_type=ApiIdInvalidError' in caplog.text
+    assert not service.attempts
 
 
 def test_current_targets_and_menu():
