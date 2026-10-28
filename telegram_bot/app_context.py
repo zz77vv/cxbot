@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from .services.login_service import LoginService
 from .config import Config
 from .clients.userbot_manager import UserbotManager
 from .services.checkin_service import CheckinService
@@ -25,3 +26,4 @@ class AppContext:
     cache: CacheService
     users: UserRepository
     requests: RequestTracker
+    logins: LoginService

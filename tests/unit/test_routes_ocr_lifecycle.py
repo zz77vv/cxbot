@@ -120,7 +120,7 @@ async def test_ocr_timeout_cannot_enqueue_more_work():
 
 
 async def test_lifecycle_close_cancels_tasks_and_resources(cfg):
-    ctx=SimpleNamespace(config=cfg,requests=RequestTracker(),jr=SimpleNamespace(accepting=True,active=set()),
+    ctx=SimpleNamespace(logins=SimpleNamespace(close=AsyncMock()),config=cfg,requests=RequestTracker(),jr=SimpleNamespace(accepting=True,active=set()),
         ocr=SimpleNamespace(close=AsyncMock()),accounts=SimpleNamespace(close=AsyncMock()),
         database=SimpleNamespace(close=AsyncMock()))
     bot=SimpleNamespace(stop_polling=AsyncMock(),close=AsyncMock())
@@ -158,7 +158,7 @@ async def test_shutdown_cancels_tracked_command_after_grace_period(cfg):
         async with tracker.track():
             started.set();await asyncio.Event().wait()
     task=asyncio.create_task(command());await started.wait()
-    ctx=SimpleNamespace(config=cfg,requests=tracker,jr=SimpleNamespace(accepting=True,active=set()),
+    ctx=SimpleNamespace(logins=SimpleNamespace(close=AsyncMock()),config=cfg,requests=tracker,jr=SimpleNamespace(accepting=True,active=set()),
         ocr=SimpleNamespace(close=AsyncMock()),accounts=SimpleNamespace(close=AsyncMock()),
         database=SimpleNamespace(close=AsyncMock()))
     life=Lifecycle(ctx,SimpleNamespace(stop_polling=AsyncMock(),close=AsyncMock()),None)

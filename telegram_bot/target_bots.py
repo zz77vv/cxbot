@@ -25,7 +25,6 @@ TARGETS = (
               'button_chain', ('签到成功', '获得', '当前金币', '金币'),
               checkin_buttons=('获得金币', '签到')),
     TargetBot('巨人', '@jrsgk', '/checkin', '/balance', r'积分余额[：:]\s*(\d+)'),
-    TargetBot('Xray', '@Xray_E_Bot', '/qd', '/info', r'积分余额[：:]\s*(\d+)'),
     TargetBot('核武器', '@hewuqi', '/qd', '个人', r'盒能\s*[:：]\s*`?(\d+)`?', balance_timeout=60),
 )
 JR = TARGETS[1]

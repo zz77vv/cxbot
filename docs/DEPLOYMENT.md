@@ -14,7 +14,7 @@ python scripts/migrate_database.py --database-copy /srv/v2-rehearsal/bot.db
 
 snapshot 使用 SQLite backup，源连接为 mode=ro，不用直接复制正在写入的 .db 文件。目标存在时拒绝覆盖。迁移脚本取得进程锁，打开副本前再生成 .backup-时间-随机值。迁移仅支持源码中确认的旧表、主键及字段，未知结构停止；不得为了迁移成功手动删除未知表。
 
-3. 核对五类旧业务表行数、抽样记录和缓存文件引用。检查 last_sign_time 单 phone 表是否展开四目标；历史 timestamp 不会变成 V2 的“确认成功”时间。迁移不删除历史用量、会员、封禁或过期缓存记录；缓存清理由运行期独立执行。
+3. 核对五类旧业务表行数、抽样记录和缓存文件引用。检查 last_sign_time 单 phone 表是否展开三个目标；历史 timestamp 不会变成 V2 的“确认成功”时间。迁移不删除历史用量、会员、封禁或过期缓存记录；缓存清理由运行期独立执行。
 4. schema_migrations 当前为 1。新增 checkin_state、checkin_attempts、query_tasks、file_leases、account_cooldowns；旧缓存缺失 result_type/file_path/file_name 时仅增加字段。事务失败回滚。高于 1 的版本拒绝降级运行。
 
 ## 切换
@@ -30,7 +30,7 @@ python scripts/check_environment.py --ocr-smoke
 python main.py
 ```
 
-首次接入生产 Telegram 前，核对管理员 ID、四个目标、Session 路径、实际消息格式和管理员菜单。先检查 /status，不通过真实批量或付费查询来替代离线测试。真实签到和查询由管理员在授权范围内验收。
+首次接入生产 Telegram 前，核对管理员 ID、三个目标、Session 路径、实际消息格式和管理员菜单。先检查 /status，不通过真实批量或付费查询来替代离线测试。真实签到和查询由管理员在授权范围内验收。
 
 Linux 可使用 systemd（修改路径和用户后由部署者安装）：
 

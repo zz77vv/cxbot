@@ -4,6 +4,8 @@ import time
 from contextlib import asynccontextmanager
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
+from telethon.sessions import MemorySession
+from .session_store import save_authorized_session
 from ..models.account import Account
 from ..models.enums import AccountState
 from ..utils.retry import retry_safe
@@ -18,7 +20,7 @@ class AccountUnavailable(RuntimeError):
 class UserbotManager:
     def __init__(self, cfg, repository, factory=None):
         self.cfg, self.repository = cfg, repository
-        self.factory = factory or (lambda path: TelegramClient(str(path), cfg.api_id, cfg.api_hash,
+        self.factory = factory or (lambda path: TelegramClient(str(path) if not isinstance(path, MemorySession) else path, cfg.api_id, cfg.api_hash,
                                     flood_sleep_threshold=0, request_retries=0, connection_retries=0,
                                     auto_reconnect=False, retry_delay=cfg.retry_base))
         self.accounts: dict[str, Account] = {}
@@ -48,7 +50,24 @@ class UserbotManager:
         self.load()
         for a in self.accounts.values():
             a.unavailable_until = cooldowns.get(a.key, 0)
-        await asyncio.gather(*(self.refresh(a, reconnect=True) for a in self.accounts.values()))
+        await asyncio.gather(*(self.refresh(a, reconnect=True) for a in tuple(self.accounts.values())))
+
+    def exists(self, key):
+        return key in self.accounts or (self.cfg.sessions / (key + '.session')).exists()
+
+    def login_client(self):
+        return self.factory(MemorySession())
+
+    async def enroll(self, key, session):
+        if self.stopping or self.exists(key):
+            raise AccountUnavailable('existing_or_stopping')
+        path = save_authorized_session(self.cfg.sessions, key, session)
+        account = Account(key, path, self.factory(path))
+        self.accounts[key] = account
+        await self.refresh(account, reconnect=True)
+        if account.state != AccountState.ONLINE:
+            raise AccountUnavailable('saved_but_reconnect_failed')
+        return account
 
     async def flood_wait(self, account, seconds):
         account.unavailable_until = max(account.unavailable_until, time.time() + max(seconds, 1))
@@ -103,7 +122,7 @@ class UserbotManager:
     async def monitor(self):
         while not self.stopping:
             await asyncio.sleep(self.cfg.reconnect_interval)
-            await asyncio.gather(*(self.refresh(a, reconnect=True) for a in self.accounts.values()))
+            await asyncio.gather(*(self.refresh(a, reconnect=True) for a in tuple(self.accounts.values())))
 
     async def close(self):
         self.stopping = True
@@ -116,4 +135,4 @@ class UserbotManager:
             except Exception as error:
                 log.warning('Disconnect failed error_type=%s', type(error).__name__)
             account.state = AccountState.OFFLINE
-        await asyncio.gather(*(disconnect(a) for a in self.accounts.values()))
+        await asyncio.gather(*(disconnect(a) for a in tuple(self.accounts.values())))

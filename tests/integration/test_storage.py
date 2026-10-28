@@ -25,12 +25,12 @@ async def test_legacy_migration_preserves_and_backs_up(cfg,with_bot):
     assert db.backup_path.is_file()
     with sqlite3.connect(db.backup_path) as c:
         assert c.execute('SELECT COUNT(*) FROM last_sign_time').fetchone()[0]==1
-    assert len(await db.fetchall('SELECT * FROM last_sign_time'))==(1 if with_bot else 4)
+    assert len(await db.fetchall('SELECT * FROM last_sign_time'))==(1 if with_bot else 3)
     assert (await db.fetchone('SELECT * FROM jr_result_cache'))['result_type']=='text'
     assert (await db.fetchone('SELECT result_text FROM jr_result_cache'))[0]=='old-result'
     await db.close()
     db=await Database(cfg.database).open()
-    assert len(await db.fetchall('SELECT * FROM last_sign_time'))==(1 if with_bot else 4)
+    assert len(await db.fetchall('SELECT * FROM last_sign_time'))==(1 if with_bot else 3)
     await db.close()
 
 
@@ -91,12 +91,9 @@ async def test_daily_limit_atomic(db):
     assert not await repo.reserve(sixth['task_id'],'10001',time.time())
 
 
-async def test_ban_unban(db):
-    async with db.transaction() as c: await c.execute('INSERT INTO banned_users VALUES(12,\'fixture\',0)')
-    users=UserRepository(db)
-    assert await users.is_banned(12)
-    assert await users.unban(12)
-    assert not await users.unban(12)
+async def test_ban_table_preserved(db):
+    async with db.transaction() as c: await c.execute("INSERT INTO banned_users VALUES(12,'fixture',0)")
+    assert await UserRepository(db).is_banned(12)
 
 
 async def test_first_schedule_is_persisted(db):

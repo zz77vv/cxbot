@@ -10,7 +10,7 @@ from telegram_bot.utils.process_lock import ProcessLock
 
 
 def env():
-    return {'BOT_TOKEN': '12345:' + 'X'*30, 'ADMIN_ID': '123', 'API_ID': '456', 'API_HASH': 'a'*32}
+    return {'BOT_TOKEN': '12345:' + 'X'*30, 'ADMIN_ID': '683298845', 'API_ID': '456', 'API_HASH': 'a'*32}
 
 
 @pytest.mark.parametrize('name', ['BOT_TOKEN','ADMIN_ID','API_ID','API_HASH'])
@@ -32,7 +32,7 @@ def test_invalid_config(tmp_path, key, value):
 def test_env_precedence_and_paths(tmp_path):
     (tmp_path/'.env').write_text('ADMIN_ID=999\nAPI_ID=999\n',encoding='utf-8')
     cfg=Config.load(tmp_path,env())
-    assert cfg.admin_id==123 and cfg.database==tmp_path/'data/bot.db'
+    assert cfg.admin_id==683298845 and cfg.database==tmp_path/'data/bot.db'
     assert cfg.bot_token not in repr(cfg) and cfg.api_hash not in repr(cfg)
 
 

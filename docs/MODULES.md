@@ -8,6 +8,8 @@ telegram_bot_v2/
 │   ├── AUDIT.md
 │   ├── CHANGES.md
 │   ├── DEPLOYMENT.md
+│   ├── GITHUB.md
+│   ├── LOGIN.md
 │   ├── MIGRATION_MAP.md
 │   ├── MODULES.md
 │   ├── TEST_REPORT.md
@@ -29,14 +31,15 @@ telegram_bot_v2/
 │   │   ├── bot_application.py
 │   │   ├── dialogue.py
 │   │   ├── request_tracker.py
+│   │   ├── session_store.py
 │   │   └── userbot_manager.py
 │   ├── handlers/
 │   │   ├── __init__.py
-│   │   ├── admin.py
 │   │   ├── balance.py
 │   │   ├── checkin.py
 │   │   ├── guards.py
 │   │   ├── jr_query.py
+│   │   ├── login.py
 │   │   ├── registration.py
 │   │   ├── start_help.py
 │   │   └── status.py
@@ -60,7 +63,8 @@ telegram_bot_v2/
 │   │   ├── __init__.py
 │   │   ├── account_status_service.py
 │   │   ├── balance_service.py
-│   │   └── checkin_service.py
+│   │   ├── checkin_service.py
+│   │   └── login_service.py
 │   ├── storage/
 │   │   ├── repositories/
 │   │   │   ├── __init__.py
@@ -99,6 +103,7 @@ telegram_bot_v2/
 │   │   ├── test_accounts_checkin_balance.py
 │   │   ├── test_architecture.py
 │   │   ├── test_config_format.py
+│   │   ├── test_login.py
 │   │   ├── test_pages_export_cache.py
 │   │   └── test_routes_ocr_lifecycle.py
 │   └── conftest.py
@@ -127,7 +132,7 @@ telegram_bot_v2/
 | `clients/dialogue.py` | 有界只读轮询、新消息和编辑关联、按钮定位 | retry |
 | `clients/request_tracker.py` | 命令在途请求生命周期 | asyncio |
 | `services/checkin_service.py` | 按账号/目标调度、成功确认、最小间隔 | manager、dialogue、CheckinRepository |
-| `services/balance_service.py` | 四目标查询和余额结果分类 | manager、dialogue、target_bots |
+| `services/balance_service.py` | 三个目标查询和余额结果分类 | manager、dialogue、target_bots |
 | `services/account_status_service.py` | 实时连接/授权状态汇总 | manager |
 | `services/jr/orchestrator.py` | 查询账本与选号、购买、导出、分页和交付的编排 | 注入的 JR 服务、QueryRepository |
 | `services/jr/account_selector.py` | 实时积分降序、日限额与未核实账号过滤、全 JR FloodWait 暂停 | BalanceService、MembershipService、QueryRepository |
@@ -187,3 +192,11 @@ handlers 的文件短是因为只承担传输层职责；没有 utils.py 或 ser
 服务实例管理自己的锁和状态；AppContext 只保存显式依赖。SQLite 事务串行化业务写入，操作系统数据库锁阻止同一数据库多进程，不能检测使用不同数据库的其他程序共享同一 Session，部署时必须停止旧进程。
 
 重启可恢复签到 next_at、last_attempt/last_success、会员用量、封禁、缓存、冷却、查询阶段/消息 ID、额度预留、交付进度。不能从一次网络超时判断第三方是否收费，也不能证明 Bot API 发送是否已交付，需人工核实。OCR 原生线程不可强行杀死；等待超时后禁止追加识别任务，正常线程退出后可以继续，永久卡死需要运维重启进程。
+
+## 本次新增模块
+
+- handlers/login.py：私聊登录命令、输入删除和安全回复；依赖 LoginService。
+- services/login_service.py：手机号/验证码/两步验证状态机、期限、取消和限流；依赖 UserbotManager，不接触数据库或日志内容。
+- clients/session_store.py：授权密钥保存、600 权限和原子不覆盖发布；依赖 Telethon SQLiteSession。
+- UserbotManager：唯一创建客户端的位置；新登录完成后重新连接检查授权并接入账号字典。
+- Lifecycle 注册登录过期清理并在退出时关闭未完成登录；成功回调增量创建三个目标的签到任务，start 自身防重复。

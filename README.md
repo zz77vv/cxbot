@@ -5,13 +5,13 @@
 用户已确认采用全新数据库部署，不导入旧 bot.db。首次配置完成后程序会创建新库。
 服务器源码目录为 `/root/cxbot`，独立虚拟环境为 `/root/cxbot/.venv`。
 Ubuntu 24.04 / Python 3.12.3 上已通过 107 项离线测试、依赖检查和本地 OCR 模型调用。
-目前尚未接入真实 Telegram 配置或创建 Session，机器人没有启动。
+目前尚未接入真实 Telegram 配置或创建 Session，机器人没有启动。本次定向修改后的 123 项测试已在本地通过，新增登录尚未在真实 Telegram 或服务器执行验收。
 
-Session 需要部署者单独进行交互登录后保存到 `sessions/数字.session`；主程序只加载现有 Session，不会批量登录或向聊天索取登录验证码、两步验证密码。新部署不需要执行旧数据库迁移步骤。
+管理员可在私聊使用 `/login` → 手机号 → 验证码 → 可选两步验证密码完成登录，`/cancel` 退出。管理员固定为 `683298845`；新部署不需要导入旧数据库。Session 保存到配置的 SESSIONS_DIR，服务器应为 `/root/cxbot/sessions/`。
 
 GitHub 使用独立源码镜像，目标为私有仓库 `zz77vv/cxbot` 的 `main`。不上传 `.env`、Session、数据库、缓存、日志、服务器登录信息或运行环境。首次发布状态与后续同步规则见 [GitHub 发布说明](docs/GITHUB.md)。
 
-基于用户提供的旧版单文件重构。保留四目标多账号签到、余额查询、JR 原有入口与结果交付、独立 OCR、会员/每日用量和 SQLite 数据；移除自动广告系统。V2 位于独立目录，未覆盖旧文件、数据库或 Session，未部署服务器。
+基于用户提供的旧版单文件重构。保留三个目标多账号签到、余额查询、JR 原有入口与结果交付、独立 OCR、会员/每日用量和 SQLite 数据；移除自动广告系统。V2 位于独立目录，未覆盖旧文件、数据库或 Session，未部署服务器。
 
 Python 3.10–3.12，实际验证 Python 3.12.14 / Windows x64。依赖版本见 requirements.txt，完整实测环境见 requirements-lock.txt。Linux 服务器仍需独立安装和验收。
 
@@ -42,7 +42,7 @@ logs/bot.log                 20 MB 轮转，保留 5 个历史文件
 .jr_cache_files/             结果文件和临时下载，禁止混放其他文件
 ```
 
-可在 `.env` 设置 DATABASE_PATH、SESSIONS_DIR、LOG_PATH、CACHE_DIR、并发和超时等。四目标指令、正则、按钮和业务上限集中在 telegram_bot/target_bots.py；签到间隔、偏移、分页和缓存寿命保持原值。
+可在 `.env` 设置 DATABASE_PATH、SESSIONS_DIR、LOG_PATH、CACHE_DIR、并发和超时等。三个目标指令、正则、按钮和业务上限集中在 telegram_bot/target_bots.py；签到间隔、偏移、分页和缓存寿命保持原值。
 
 旧数据先按 [升级和回滚步骤](docs/DEPLOYMENT.md) 制作副本并演练迁移。没有 Session 时 V2 仍可显示管理员状态，但不能执行账号业务；程序不会代为登录。未授权账号需部署者独立处理。
 
@@ -54,7 +54,7 @@ python main.py
 
 Linux 支持 SIGTERM/SIGINT；Windows 使用 Ctrl+C。关闭时停止接收任务，等待在途请求最多 SHUTDOWN_TIMEOUT 秒，取消剩余请求并记录待核实状态，再关闭后台任务、Bot API、OCR、用户客户端和数据库。不要同时运行旧版和 V2 访问同一批 Session。不要通过删除锁文件启动第二个进程。
 
-管理员命令：`/start`、`/help`、`/jr 内容`、`/jr+内容`、`/qd`、`/jf`、`/zt`、`/status`、`/unban 用户ID`。普通用户只能获得无开放功能提示；封禁用户被提前拦截。Bot API 菜单不允许 `+` 字符，故菜单注册 jr，帮助中同时说明 jr+。
+管理员命令：`/start`、`/help`、`/jr 内容`、`/jr+内容`、`/qd`、`/jf`、`/status`、`/login`、`/cancel`。全部入口仅允许指定管理员，普通用户在业务执行前被拦截。Bot API 菜单不允许 `+` 字符，故菜单注册 jr，帮助中同时说明 jr+。
 
 ## 关键行为
 
@@ -87,3 +87,5 @@ pending_review/manual/交付 unknown：先停止机器人，运行 `python scrip
 缓存目录外的旧绝对文件路径不会被下载、发送或删除，必须由部署者选择沿用原缓存根目录，或在副本上人工审计后重新映射路径。备份不自动清理，需设置服务器独立的容量监控和保留策略。
 
 模块定位见 [维护与依赖说明](docs/MODULES.md)、[逐函数迁移表](docs/MIGRATION_MAP.md) 和 [改动清单](docs/CHANGES.md)。原检查报告见 [阶段 A](docs/AUDIT.md)。
+
+登录安全和验证范围见 [在线登录说明](docs/LOGIN.md)。

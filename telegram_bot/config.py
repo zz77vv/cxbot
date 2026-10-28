@@ -46,6 +46,7 @@ class Config:
     cleanup_interval: int = 60
     ocr_timeout: float = 20
     shutdown_timeout: float = 30
+    login_ttl: float = 300
 
     @classmethod
     def load(cls, root: Path | None = None, environ=None):
@@ -91,7 +92,10 @@ class Config:
                   positive('RETRY_ATTEMPTS', 3), positive('RETRY_BASE', 2, float),
                   positive('RECONNECT_INTERVAL', 60, float),
                   ocr_timeout=positive('OCR_TIMEOUT', 20, float),
-                  shutdown_timeout=positive('SHUTDOWN_TIMEOUT', 30, float))
+                  shutdown_timeout=positive('SHUTDOWN_TIMEOUT', 30, float),
+                  login_ttl=positive('LOGIN_TTL', 300, float))
+        if cfg.admin_id != 683298845:
+            raise ConfigError('ADMIN_ID 必须为指定管理员 683298845')
         for protected in (cfg.database, cfg.sessions, cfg.log_file):
             if protected == cfg.cache or cfg.cache in protected.parents:
                 raise ConfigError('缓存目录不得包含数据库、Session 或日志')

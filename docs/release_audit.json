@@ -2,7 +2,7 @@
   "legacy_sha256": "f11e3de3743434f1ee8168683285dca4b54c0c00e93f77fbe25b2a4693106c37",
   "legacy_unchanged_checked": true,
   "sensitive_literal_scan": "passed",
-  "source_files": 92,
+  "source_files": 96,
   "packaging": "allowlist; no runtime databases/sessions/logs/env/cache/venv",
   "github": "not configured; no repository, remote or synchronization target",
   "server": "not accessed"

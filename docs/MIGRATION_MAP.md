@@ -29,7 +29,7 @@
 | `increment_jr_daily_usage` | 612 | `telegram_bot/storage/repositories/membership_repository.py` |
 | `get_jr_account_state_snapshot` | 624 | `telegram_bot/storage/repositories/membership_repository.py` |
 | `is_user_banned` | 657 | `telegram_bot/storage/repositories/user_repository.py` |
-| `unban_user` | 667 | `telegram_bot/storage/repositories/user_repository.py` |
+| `unban_user` | 667 | `removed: command retired` |
 | `get_phone` | 677 | `telegram_bot/clients/userbot_manager.py` |
 | `get_client_lock` | 681 | `telegram_bot/clients/userbot_manager.py` |
 | `reply_long` | 687 | `telegram_bot/utils/message_format.py` |
@@ -97,7 +97,7 @@
 | `jr_plus_handler` | 2651 | `telegram_bot/handlers/jr_query.py` |
 | `start_command` | 2671 | `telegram_bot/handlers/start_help.py` |
 | `help_command` | 2700 | `telegram_bot/handlers/start_help.py` |
-| `unban_command` | 2705 | `telegram_bot/handlers/admin.py` |
+| `unban_command` | 2705 | `removed: command retired` |
 | `qd_command` | 2719 | `telegram_bot/handlers/checkin.py` |
 | `jf_command` | 2759 | `telegram_bot/handlers/balance.py` |
 | `status_command` | 2797 | `telegram_bot/handlers/status.py` |

@@ -78,7 +78,7 @@ async def test_checkin_missing_button(manager,db):
     assert result.outcome==Outcome.FAILED
 
 
-@pytest.mark.parametrize('index,text,value',[(0,'金币🪙: 0',0),(1,'积分余额：123',123),(2,'积分余额:9',9),(3,'盒能：`10`',10)])
+@pytest.mark.parametrize('index,text,value',[(0,'金币🪙: 0',0),(1,'积分余额：123',123),(2,'盒能：`10`',10)])
 def test_original_balance_patterns(index,text,value):
     assert parse_balance(text,TARGETS[index]).value==value
     assert parse_balance('changed format',TARGETS[index]).outcome==Outcome.FORMAT_CHANGED
@@ -122,7 +122,7 @@ async def test_scheduler_duplicate_and_cancel(manager,db):
     service=CheckinService(manager,CheckinRepository(db),SimpleNamespace())
     registry=TaskRegistry()
     service.start(registry); service.start(registry)
-    assert len(registry.tasks)==4
+    assert len(registry.tasks)==3
     await asyncio.sleep(0.01)
     await registry.close()
     assert all(t.done() for t in service.tasks.values())

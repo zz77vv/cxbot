@@ -50,6 +50,7 @@ class Lifecycle:
                 await self.ctx.jr.exports.notify(row['task_id'], row['state'], 'restart_requires_review')
             await self.ctx.cache.cleanup()
             self.ctx.checkins.start(self.registry)
+            self.registry.start(self.ctx.logins.loop(), 'login-expiry')
             self.registry.start(self.ctx.accounts.monitor(), 'account-monitor')
             self.registry.start(self.ctx.cache.loop(), 'cache-cleanup')
             log.info('V2 started accounts=%d', len(self.ctx.accounts.accounts))
@@ -76,7 +77,7 @@ class Lifecycle:
                 task.cancel()
             await asyncio.gather(*active, return_exceptions=True)
         await self.registry.close()
-        for name, close in [('bot', self.bot.close), ('ocr', self.ctx.ocr.close),
+        for name, close in [('logins', self.ctx.logins.close), ('bot', self.bot.close), ('ocr', self.ctx.ocr.close),
                              ('accounts', self.ctx.accounts.close), ('database', self.ctx.database.close)]:
             try:
                 await close()

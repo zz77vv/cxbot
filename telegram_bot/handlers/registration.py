@@ -4,8 +4,8 @@ from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
                        BotCommandScopeAllChatAdministrators)
 from telegram.ext import CommandHandler, MessageHandler, filters
 from telegram.error import NetworkError
-from . import start_help, checkin, balance, jr_query, status, admin
-from .guards import banned_guard
+from . import start_help, checkin, balance, jr_query, status, login
+from .guards import admin_guard
 from ..utils.retry import retry_safe
 
 COMMANDS = {
@@ -14,9 +14,9 @@ COMMANDS = {
     'jr': '查询内容 - 巨人查询（也支持 /jr+内容）',
     'qd': '手动触发所有账号签到',
     'jf': '查询所有账号签到积分',
-    'zt': '查看运行状态',
     'status': '查看运行状态',
-    'unban': '用户ID - 管理员解封用户',
+    'login': '私聊登录协议号',
+    'cancel': '取消私聊登录',
 }
 
 
@@ -25,13 +25,15 @@ def register(application, ctx):
     state = status.make_handler(ctx)
     callbacks = {'start': menu, 'help': menu, 'jr': jr_query.make_handler(ctx),
                  'qd': checkin.make_handler(ctx), 'jf': balance.make_handler(ctx),
-                 'zt': state, 'status': state, 'unban': admin.make_handler(ctx)}
-    application.add_handler(MessageHandler(filters.COMMAND, banned_guard(ctx)), group=-1)
+                 'status': state, 'login': login.start_handler(ctx), 'cancel': login.cancel_handler(ctx)}
+    application.add_handler(MessageHandler(filters.ALL, admin_guard(ctx)), group=-1)
     for command, callback in callbacks.items():
         if command == 'jr':
             application.add_handler(MessageHandler(filters.TEXT & filters.Regex(jr_query.JR_ROUTE), callback))
         else:
             application.add_handler(CommandHandler(command, callback))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, login.input_handler(ctx)))
 
     async def on_error(update, context):
         logging.getLogger(__name__).error('Update handling failed error_type=%s', type(context.error).__name__)
