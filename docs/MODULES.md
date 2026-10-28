@@ -200,3 +200,5 @@ handlers 的文件短是因为只承担传输层职责；没有 utils.py 或 ser
 - clients/session_store.py：授权密钥保存、600 权限和原子不覆盖发布；依赖 Telethon SQLiteSession。
 - UserbotManager：唯一创建客户端的位置；新登录完成后重新连接检查授权并接入账号字典。
 - Lifecycle 注册登录过期清理并在退出时关闭未完成登录；成功回调增量创建三个目标的签到任务，start 自身防重复。
+
+- handlers/menu_sync.py：集中管理员菜单注册，对尚未建立的私聊延后注册；registration 和 start_help 共同调用，不产生反向导入。

@@ -3,7 +3,8 @@ from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
                        BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
                        BotCommandScopeAllChatAdministrators)
 from telegram.ext import CommandHandler, MessageHandler, filters
-from telegram.error import NetworkError
+from telegram.error import NetworkError, BadRequest
+from .menu_sync import missing_private_chat, set_admin_menu
 from . import start_help, checkin, balance, jr_query, status, login
 from .guards import admin_guard
 from ..utils.retry import retry_safe
@@ -46,10 +47,12 @@ async def configure_menus(bot, cfg):
               BotCommandScopeAllChatAdministrators(), BotCommandScopeChat(cfg.admin_id))
     for scope in scopes:
         for language in ('', 'zh', 'en'):
-            await retry_safe(lambda: bot.delete_my_commands(scope=scope, language_code=language),
-                             attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+            try:
+                await retry_safe(lambda: bot.delete_my_commands(scope=scope, language_code=language),
+                                 attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+            except BadRequest as error:
+                if not isinstance(scope, BotCommandScopeChat) or not missing_private_chat(error):
+                    raise
     await retry_safe(lambda: bot.set_my_commands([], scope=BotCommandScopeDefault()),
                      attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
-    await retry_safe(lambda: bot.set_my_commands([BotCommand(name, desc) for name, desc in COMMANDS.items()],
-                                               scope=BotCommandScopeChat(cfg.admin_id)),
-                     attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+    await set_admin_menu(bot, cfg, COMMANDS)
