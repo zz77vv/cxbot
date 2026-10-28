@@ -22,7 +22,8 @@ class UserbotManager:
         self.cfg, self.repository = cfg, repository
         self.factory = factory or (lambda path: TelegramClient(str(path) if not isinstance(path, MemorySession) else path, cfg.api_id, cfg.api_hash,
                                     flood_sleep_threshold=0, request_retries=0, connection_retries=0,
-                                    auto_reconnect=False, retry_delay=cfg.retry_base))
+                                    auto_reconnect=False, retry_delay=cfg.retry_base,
+                                    raise_last_call_error=isinstance(path, MemorySession)))
         self.accounts: dict[str, Account] = {}
         self.semaphore = asyncio.Semaphore(cfg.concurrency)
         self.stopping = False

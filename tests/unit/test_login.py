@@ -182,3 +182,30 @@ def test_current_targets_and_menu():
     from telegram_bot.handlers.registration import COMMANDS
     assert {t.bot for t in TARGETS}=={'@zhonghybot','@jrsgk','@hewuqi'}
     assert set(COMMANDS)=={'start','help','jr','qd','jf','status','login','cancel'}
+
+
+async def test_login_dc_routing_retry_is_bounded(login,cfg):
+    from telethon.errors import PhoneMigrateError
+    service,client,manager,_=login
+    client.send_code_request.side_effect=[PhoneMigrateError(None,capture=2),SimpleNamespace(phone_code_hash='transient')]
+    assert '验证码' in await start_phone(service,cfg)
+    assert client.send_code_request.await_count==2
+    await service.close()
+    client.send_code_request.side_effect=PhoneMigrateError(None,capture=2)
+    before=client.send_code_request.await_count
+    await start_phone(service,cfg)
+    assert client.send_code_request.await_count-before==2 and not service.attempts
+
+
+async def test_timeout_does_not_repeat_code_request(login,cfg):
+    service,client,manager,_=login
+    client.send_code_request.side_effect=TimeoutError()
+    await start_phone(service,cfg)
+    client.send_code_request.assert_awaited_once()
+
+
+async def test_login_factory_preserves_underlying_rpc_error(cfg,db):
+    manager=UserbotManager(cfg,AccountRepository(db))
+    client=manager.login_client()
+    assert client._raise_last_call_error and client._request_retries==0
+    await client.disconnect()

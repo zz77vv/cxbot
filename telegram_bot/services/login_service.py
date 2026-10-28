@@ -5,7 +5,8 @@ import time
 import logging
 from dataclasses import dataclass, field
 from collections import deque
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import (SessionPasswordNeededError, FloodWaitError,
+                              PhoneMigrateError, NetworkMigrateError, UserMigrateError)
 
 
 @dataclass(repr=False)
@@ -118,7 +119,14 @@ class LoginService:
                 return '该账号已存在 Session，禁止覆盖；请使用 /status 查看状态。'
             attempt.client = self.manager.login_client()
             await attempt.client.connect()
-            response = await attempt.client.send_code_request('+' + attempt.phone)
+            try:
+                response = await attempt.client.send_code_request('+' + attempt.phone)
+            except (PhoneMigrateError, NetworkMigrateError, UserMigrateError):
+                # Telethon has already switched to the DC explicitly required by
+                # Telegram. No code was sent on the rejected DC. Retry only once;
+                # never repeat on timeouts, server errors or rate limits.
+                logging.getLogger(__name__).info('Login DC routing updated; one directed retry')
+                response = await attempt.client.send_code_request('+' + attempt.phone)
             attempt.code_hash = response.phone_code_hash
             attempt.phase = 'code'
             return '请输入 Telegram 登录验证码；如验证码被 Telegram 判定为转发而失效，请取消后使用服务器本地登录。'
