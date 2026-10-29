@@ -103,3 +103,230 @@ if __name__ == '__main__':
     main()
 
 ===== END FILE: main.py =====
+
+===== BEGIN FILE: scripts/audit_release.py =====
+"""Audit a curated source-only release; never print sensitive literal values."""
+import argparse
+import ast
+import hashlib
+import json
+from pathlib import Path
+import zipfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def release_files():
+    top = ['main.py', 'requirements.txt', 'requirements-dev.txt', 'requirements-lock.txt',
+           '.env.example', '.gitignore', 'README.md', 'pytest.ini']
+    paths = [ROOT / name for name in top]
+    for directory in ('telegram_bot', 'tests', 'scripts'):
+        paths.extend(p for p in (ROOT / directory).rglob('*') if p.is_file()
+                     and p.suffix in ('.py', '.md') and '__pycache__' not in p.parts)
+    paths.extend(p for p in (ROOT / 'docs').iterdir() if p.is_file() and p.suffix in ('.md', '.json', '.xml'))
+    return sorted(set(paths))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--legacy-source', type=Path)
+    parser.add_argument('--zip', type=Path)
+    args = parser.parse_args()
+    inventory = json.loads((ROOT / 'docs/legacy_inventory.json').read_text(encoding='utf-8'))
+    secrets = []
+    if args.legacy_source:
+        payload = args.legacy_source.read_bytes()
+        if hashlib.sha256(payload).hexdigest() != inventory['sha256']:
+            raise ValueError('旧源码 SHA256 与初始检查不一致')
+        tree = ast.parse(payload.decode('utf-8-sig'))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(isinstance(n, ast.Name) and n.id in {'BOT_TOKEN', 'API_HASH'} for n in node.targets):
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str) and node.value.value:
+                    secrets.append(node.value.value)
+        print('Legacy SHA256: unchanged; sensitive values loaded only for in-memory matching')
+    files = release_files()
+    for path in files:
+        text = path.read_text(encoding='utf-8-sig')
+        if any(secret in text for secret in secrets):
+            raise ValueError('交付文件命中源凭据；停止打包（不回显值）')
+        if path.suffix == '.py':
+            ast.parse(text)
+    report = {
+        'legacy_sha256': inventory['sha256'],
+        'legacy_unchanged_checked': bool(args.legacy_source),
+        'sensitive_literal_scan': 'passed' if secrets else 'no_legacy_values_supplied',
+        'source_files': len(set(files) | {ROOT / 'docs/release_audit.json', ROOT / 'docs/release_manifest.json'}),
+        'packaging': 'allowlist; no runtime databases/sessions/logs/env/cache/venv',
+        'github': 'not configured; no repository, remote or synchronization target',
+        'server': 'not accessed',
+    }
+    (ROOT / 'docs/release_audit.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    files = release_files()
+    excluded = {'docs/release_manifest.json'}
+    manifest = {str(p.relative_to(ROOT)).replace('\\', '/'): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in files if str(p.relative_to(ROOT)).replace('\\', '/') not in excluded}
+    (ROOT / 'docs/release_manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    print('Release audit passed:', len(manifest), 'hashed source/test/document files')
+    if args.zip:
+        destination = args.zip.resolve()
+        # Never overwrite an existing delivery archive.
+        with zipfile.ZipFile(destination, 'x', compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in release_files():
+                archive.write(path, 'telegram_bot_v2/' + str(path.relative_to(ROOT)).replace('\\', '/'))
+        with zipfile.ZipFile(destination) as archive:
+            if archive.testzip() is not None:
+                raise ValueError('压缩包校验失败')
+            forbidden = {'.db', '.session', '.log', '.pyc'}
+            if any(Path(n).suffix in forbidden or '/.venv/' in n or n.endswith('/.env') for n in archive.namelist()):
+                raise ValueError('压缩包包含运行数据，停止交付')
+        print('ZIP validated:', destination.name)
+
+
+if __name__ == '__main__':
+    main()
+===== END FILE: scripts/audit_release.py =====
+
+
+===== BEGIN FILE: scripts/check_environment.py =====
+"""Offline diagnostics; never loads credentials or opens production runtime data."""
+import argparse
+import asyncio
+import importlib
+import importlib.metadata
+import sys
+from pathlib import Path
+from io import BytesIO
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+async def ocr_smoke():
+    from PIL import Image, ImageDraw
+    from telegram_bot.services.jr.ocr_service import OCRService
+    from telegram_bot.models.enums import Outcome
+    image = Image.new('RGB', (200, 80), 'white')
+    ImageDraw.Draw(image).text((20, 25), '1234', fill='black')
+    output = BytesIO()
+    image.save(output, format='PNG')
+    service = OCRService(timeout=30)
+    try:
+        result = await service.recognize(output.getvalue(), charset='1234567890')
+        print(f'OCR model inference: {result.outcome.value}, {result.error_type or "OK"}')
+        return result.outcome == Outcome.SUCCESS or result.error_type == 'LowConfidence'
+    finally:
+        await service.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ocr-smoke', action='store_true', help='Run the local model on a synthetic image')
+    args = parser.parse_args()
+    print('Python:', sys.version.split()[0])
+    if not (3, 10) <= sys.version_info[:2] <= (3, 12):
+        print('Supported Python versions: 3.10–3.12; verified on 3.12.14')
+        return 1
+    modules = {'Telethon': 'telethon', 'python-telegram-bot': 'telegram', 'aiosqlite': 'aiosqlite',
+               'Pillow': 'PIL', 'ddddocr': 'ddddocr', 'onnxruntime': 'onnxruntime'}
+    failed = False
+    for package, module in modules.items():
+        try:
+            importlib.import_module(module)
+            print(f'{package}: {importlib.metadata.version(package)} (import OK)')
+        except Exception as error:
+            failed = True
+            print(f'{package}: import FAILED ({type(error).__name__})')
+    if args.ocr_smoke and not failed:
+        failed = not asyncio.run(ocr_smoke())
+    return int(failed)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+===== END FILE: scripts/check_environment.py =====
+
+
+===== BEGIN FILE: scripts/deliver_saved.py =====
+"""Explicitly send an operator-confirmed undelivered saved result. No userbot clients."""
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from telegram import Bot
+from telegram_bot.config import Config
+from telegram_bot.logging_config import configure_logging
+from telegram_bot.storage.database import Database
+from telegram_bot.storage.repositories.query_repository import QueryRepository, result_from_row
+from telegram_bot.storage.repositories.cache_repository import CacheRepository
+from telegram_bot.services.jr.cache_service import CacheService
+from telegram_bot.services.jr.export_service import ExportService
+from telegram_bot.utils.process_lock import ProcessLock
+
+
+async def deliver(task):
+    cfg = Config.load()
+    lock = ProcessLock(cfg.database)
+    lock.acquire()
+    handler = configure_logging(cfg)
+    db = None
+    try:
+        db = await Database(cfg.database).open()
+        repo = QueryRepository(db)
+        row = await repo.get(task)
+        result = result_from_row(row)
+        if not row or row['state'] != 'success' or row['delivery_state'] != 'not_started' or not result:
+            raise ValueError('结果不可重发；先核实并用 review_tasks 设置交付状态为 not_started')
+        async with Bot(cfg.bot_token) as bot:
+            exports = ExportService(cfg, None, repo, CacheService(cfg, CacheRepository(db)), bot)
+            await exports.deliver(task, result)
+        print('已交付保存的结果；没有重发查询或购买。')
+    finally:
+        if db:
+            await db.close()
+        handler.close()
+        lock.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--task', required=True)
+    args = parser.parse_args()
+    asyncio.run(deliver(args.task))
+===== END FILE: scripts/deliver_saved.py =====
+
+
+===== BEGIN FILE: scripts/migrate_database.py =====
+"""Explicit migration of an operator-chosen COPY; does not connect to Telegram."""
+import argparse
+import asyncio
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from telegram_bot.storage.database import Database
+from telegram_bot.utils.process_lock import ProcessLock
+
+
+async def migrate_copy(path):
+    lock = ProcessLock(path)
+    lock.acquire()
+    try:
+        db = await Database(path).open()
+        try:
+            print('迁移成功，schema=1；迁移前备份：', db.backup_path)
+        finally:
+            await db.close()
+    finally:
+        lock.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--database-copy', type=Path, required=True)
+    args = parser.parse_args()
+    if not args.database_copy.is_file():
+        parser.error('必须指定已存在的数据库副本')
+    asyncio.run(migrate_copy(args.database_copy.resolve()))
+===== END FILE: scripts/migrate_database.py =====
