@@ -8,7 +8,7 @@ from ...models.query import JRQueryResult, QueryReport
 from ...storage.repositories.query_repository import result_from_row
 from ...utils.keyed_locks import KeyedLocks
 from .cache_service import jr_cache_key, CacheInconsistent
-from .account_selector import RateLimitEncountered
+from .account_selector import NoEligibleAccountError, RateLimitEncountered
 from .pagination import ManualVerification
 from .result_parser import classify, find_buy_button
 from .verification_service import VerificationError
@@ -53,8 +53,8 @@ class Orchestrator:
                 return await self._deliver(task, cached, 'cache_hit')
             ranked = await self.selector.rank()
             if not ranked:
-                await self.repository.transition(task, QueryState.FAILED, 'no_available_balance')
-                return QueryReport(task, QueryState.FAILED, 'no_available_balance')
+                await self.repository.transition(task, QueryState.FAILED, 'no_eligible_account')
+                return QueryReport(task, QueryState.FAILED, 'no_eligible_account')
             # Only one chosen account may receive the request. A limit never triggers rotation.
             account = ranked[0][0]
             async with self.manager.operation(account) as client:
@@ -112,6 +112,9 @@ class Orchestrator:
             raise
         except (CacheInconsistent, ManualVerification) as error:
             return await self._hold(task, QueryState.MANUAL, str(error))
+        except NoEligibleAccountError as error:
+            await self.repository.transition(task, QueryState.FAILED, error.reason)
+            return QueryReport(task, QueryState.FAILED, error.reason)
         except RateLimitEncountered:
             await self.repository.transition(task, QueryState.FAILED, 'telegram_flood_wait_no_submission')
             return QueryReport(task, QueryState.FAILED, 'telegram_flood_wait_no_submission')

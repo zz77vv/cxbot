@@ -1,11 +1,28 @@
 import asyncio
 import time
+from dataclasses import dataclass
 from ...models.enums import AccountState, Outcome
 from ...target_bots import JR
 
 
 class RateLimitEncountered(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AccountExclusion:
+    account: str
+    reason: str
+
+
+class NoEligibleAccountError(RuntimeError):
+    def __init__(self, exclusions: tuple[AccountExclusion, ...]):
+        self.exclusions = exclusions
+        reasons = {item.reason for item in exclusions}
+        self.reason = next(iter(reasons)) if len(reasons) == 1 else 'no_eligible_account'
+        if not exclusions:
+            self.reason = 'no_accounts_loaded'
+        super().__init__(self.reason)
 
 
 class AccountSelector:
@@ -18,15 +35,24 @@ class AccountSelector:
         if any(a.unavailable_until > time.time() for a in self.manager.accounts.values()):
             raise RateLimitEncountered('telegram_flood_wait_no_account_rotation')
         async def evaluate(a):
-            if a.state != AccountState.ONLINE or not await self.memberships.eligible(a.key):
-                return None
+            if a.state != AccountState.ONLINE:
+                return AccountExclusion(a.key, 'account_not_online')
+            if not await self.memberships.eligible(a.key):
+                return AccountExclusion(a.key, 'daily_query_limit_reached')
             if await self.queries.unresolved_account(a.key):
-                return None
+                return AccountExclusion(a.key, 'account_has_unresolved_task')
             async with self.semaphore:
                 balance = await self.balances.query(a, JR)
             return a, balance
         results = await asyncio.gather(*(evaluate(a) for a in self.manager.accounts.values()))
-        if any(item and item[1].outcome == Outcome.RATE_LIMITED for item in results):
+        evaluated = [item for item in results if not isinstance(item, AccountExclusion)]
+        if any(item[1].outcome == Outcome.RATE_LIMITED for item in evaluated):
             raise RateLimitEncountered('telegram_flood_wait_no_account_rotation')
-        return sorted((item for item in results if item and item[1].outcome == Outcome.SUCCESS),
-                      key=lambda item: -item[1].value)
+        ranked = sorted((item for item in evaluated if item[1].outcome == Outcome.SUCCESS),
+                        key=lambda item: -item[1].value)
+        if not ranked:
+            exclusions = [item for item in results if isinstance(item, AccountExclusion)]
+            exclusions.extend(AccountExclusion(a.key, f'balance_query_{balance.outcome.value}')
+                              for a, balance in evaluated)
+            raise NoEligibleAccountError(tuple(exclusions))
+        return ranked

@@ -15,6 +15,7 @@ from telegram_bot.models.enums import Outcome,QueryState
 from telegram_bot.models.query import JRQueryResult
 from telegram_bot.services.jr.ocr_service import OCRService
 from telegram_bot.services.jr.verification_service import VerificationService, VerificationError
+from telegram_bot.services.jr.account_selector import AccountExclusion, NoEligibleAccountError
 
 
 @pytest.fixture
@@ -44,6 +45,18 @@ async def test_query_success_and_cache(setup_jr,db,bot):
     assert target.submit.await_count==1
     assert (await db.fetchone('SELECT query_count FROM jr_daily_usage'))[0]==1
     assert bot.send_message.await_count==2
+
+
+async def test_selection_rejection_never_reserves_or_submits(setup_jr,db):
+    jr,repo,target,*_=setup_jr
+    jr.selector.rank.side_effect=NoEligibleAccountError((
+        AccountExclusion('10001','account_has_unresolved_task'),))
+    report=await jr.execute('blocked-update','fixture')
+    assert report.reason=='account_has_unresolved_task' and report.state==QueryState.FAILED
+    row=await repo.get(report.task_id)
+    assert row['account'] is None and row['reserved']==0 and row['sent_id'] is None
+    target.submit.assert_not_awaited()
+    assert await db.fetchone('SELECT * FROM jr_daily_usage') is None
 
 
 async def test_duplicate_update_does_not_deliver_twice(setup_jr,bot):
