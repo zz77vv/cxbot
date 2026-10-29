@@ -95,3 +95,11 @@ FILE INDEX
 81. .env.example
 82. pytest.ini
 
+
+===== BEGIN FILE: main.py =====
+from telegram_bot.bootstrap import main
+
+if __name__ == '__main__':
+    main()
+
+===== END FILE: main.py =====
