@@ -2933,3 +2933,297 @@ class AccountRepository:
         async with self.db.transaction() as c:
             await c.execute('INSERT INTO account_cooldowns VALUES(?,?) ON CONFLICT(phone) DO UPDATE SET until_at=MAX(until_at,excluded.until_at)', (account, until))
 ===== END FILE: telegram_bot/storage/repositories/account_repository.py =====
+
+===== BEGIN FILE: telegram_bot/storage/repositories/cache_repository.py =====
+from contextlib import asynccontextmanager
+from ...models.enums import UNRESOLVED
+
+
+class CacheRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def get(self, key, now):
+        return await self.db.fetchone('SELECT * FROM jr_result_cache WHERE cache_key=? AND expires_at>?', (key, now))
+
+    @asynccontextmanager
+    async def lease(self, path, owner):
+        async with self.db.transaction() as c:
+            await c.execute('INSERT OR IGNORE INTO file_leases VALUES(?,?)', (path, owner))
+        try:
+            yield
+        finally:
+            async with self.db.transaction() as c:
+                await c.execute('DELETE FROM file_leases WHERE path=? AND owner=?', (path, owner))
+
+    async def expire_and_references(self, now, ttl):
+        async with self.db.transaction() as c:
+            await c.execute('DELETE FROM jr_result_cache WHERE expires_at<=?', (now,))
+            # Keep undelivered results and unresolved tasks even beyond the cache TTL.
+            await c.execute("UPDATE query_tasks SET result_text=NULL,file_path=NULL,file_name=NULL WHERE state='success' AND delivery_state='delivered' AND updated_at<?", (now - ttl,))
+            await c.execute("UPDATE query_tasks SET result_text=NULL,file_path=NULL,file_name=NULL WHERE state='failed' AND updated_at<?", (now - ttl,))
+            async with c.execute('SELECT file_path FROM jr_result_cache WHERE file_path IS NOT NULL UNION SELECT file_path FROM query_tasks WHERE file_path IS NOT NULL UNION SELECT path FROM file_leases') as cur:
+                return [r[0] for r in await cur.fetchall()]
+
+    async def clear_stale_leases(self):
+        # Called only after acquiring the process-wide database lock.
+        async with self.db.transaction() as c:
+            await c.execute('DELETE FROM file_leases')
+===== END FILE: telegram_bot/storage/repositories/cache_repository.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/checkin_repository.py =====
+from ..sql import one
+
+
+class CheckinRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def get(self, account, bot):
+        return await self.db.fetchone('SELECT * FROM checkin_state WHERE phone=? AND bot=?', (account, bot))
+
+    async def initialize(self, account, bot, now, rng):
+        async with self.db.transaction() as c:
+            row = await one(c, 'SELECT * FROM checkin_state WHERE phone=? AND bot=?', (account, bot))
+            if row:
+                return row
+            old = await one(c, 'SELECT timestamp FROM last_sign_time WHERE phone=? AND lower(trim(bot))=?', (account, bot))
+            next_at = now + rng.uniform(0, 86400) if not old else max(
+                now + rng.uniform(1, 5), old[0] + 86400 + rng.uniform(0, 900))
+            await c.execute("INSERT INTO checkin_state(phone,bot,next_at,outcome) VALUES(?,?,?,'unknown')", (account, bot, next_at))
+            return await one(c, 'SELECT * FROM checkin_state WHERE phone=? AND bot=?', (account, bot))
+
+    async def attempted(self, account, bot, now):
+        async with self.db.transaction() as c:
+            await c.execute("UPDATE checkin_state SET last_attempt=?,outcome='pending_review',reason='attempt_in_progress',next_at=? WHERE phone=? AND bot=?",
+                            (now, now + 86400, account, bot))
+
+    async def finish(self, account, bot, now, result, next_at):
+        async with self.db.transaction() as c:
+            await c.execute('INSERT INTO checkin_attempts(phone,bot,attempted_at,outcome,error_type,reason) VALUES(?,?,?,?,?,?)',
+                            (account, bot, now, result.outcome.value, result.error_type, result.reason))
+            await c.execute('UPDATE checkin_state SET outcome=?,reason=?,error_type=?,next_at=? WHERE phone=? AND bot=?',
+                            (result.outcome.value, result.reason, result.error_type, next_at, account, bot))
+            if result.outcome.value == 'success':
+                await c.execute('UPDATE checkin_state SET last_success=? WHERE phone=? AND bot=?', (now, account, bot))
+                await c.execute('INSERT INTO last_sign_time VALUES(?,?,?) ON CONFLICT(phone,bot) DO UPDATE SET timestamp=excluded.timestamp', (account, bot, now))
+
+    async def legacy_baseline(self, account, bot):
+        row = await self.db.fetchone('SELECT timestamp FROM last_sign_time WHERE phone=? AND lower(trim(bot))=?', (account, bot))
+        return row[0] if row else None
+===== END FILE: telegram_bot/storage/repositories/checkin_repository.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/membership_repository.py =====
+from datetime import datetime, timedelta, timezone
+
+
+def usage_date(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone(timedelta(hours=8))).date().isoformat()
+
+
+class MembershipRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def state(self, account, now):
+        row = await self.db.fetchone('SELECT status,checked_at FROM jr_membership WHERE phone=?', (account,))
+        usage = await self.db.fetchone('SELECT query_count FROM jr_daily_usage WHERE phone=? AND usage_date=?', (account, usage_date(now)))
+        reserved = await self.db.fetchone('SELECT COUNT(*) FROM query_tasks WHERE account=? AND reserved=1 AND usage_date=?', (account, usage_date(now)))
+        return (row['status'] if row else 'unknown', row['checked_at'] if row else 0,
+                (usage[0] if usage else 0) + reserved[0])
+===== END FILE: telegram_bot/storage/repositories/membership_repository.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/query_repository.py =====
+import time
+import uuid
+from ..sql import one
+from .membership_repository import usage_date
+from ...models.enums import UNRESOLVED, QueryState
+from ...models.query import JRQueryResult
+
+
+PLACEHOLDERS = ','.join('?' for _ in UNRESOLVED)
+
+
+def result_from_row(row):
+    if not row or not row['result_type']:
+        return None
+    return JRQueryResult(row['result_type'], row['result_text'] or '', row['file_path'],
+                         row['file_name'], row['export_status'] or 'unknown')
+
+
+class QueryRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def claim(self, request_id, key, now):
+        async with self.db.transaction() as c:
+            old = await one(c, 'SELECT * FROM query_tasks WHERE request_id=?', (request_id,))
+            if old:
+                return old, False
+            old = await one(c, f'SELECT * FROM query_tasks WHERE cache_key=? AND '
+                            f'(state IN ({PLACEHOLDERS}) OR (state=\'success\' AND delivery_state<>\'delivered\')) ORDER BY created_at DESC LIMIT 1',
+                            (key, *UNRESOLVED))
+            if old:
+                return old, False
+            task = uuid.uuid4().hex
+            await c.execute('INSERT INTO query_tasks(task_id,request_id,cache_key,state,phase,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
+                            (task, request_id, key, 'prepared', 'prepared', now, now))
+            return await one(c, 'SELECT * FROM query_tasks WHERE task_id=?', (task,)), True
+
+    async def get(self, task):
+        return await self.db.fetchone('SELECT * FROM query_tasks WHERE task_id=?', (task,))
+
+    async def recent_metadata(self, limit=100):
+        return await self.db.fetchall('SELECT task_id,account,state,phase,sent_id,source_id,delivery_state,delivery_cursor FROM query_tasks ORDER BY created_at DESC LIMIT ?', (limit,))
+
+    async def unresolved_account(self, account, excluding=''):
+        return await self.db.fetchone(f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
+                                     (account, excluding, *UNRESOLVED)) is not None
+
+    async def reserve(self, task, account, now, limit=5):
+        async with self.db.transaction() as c:
+            blocked = await one(c, f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
+                                (account, task, *UNRESOLVED))
+            if blocked:
+                return False
+            membership = await one(c, 'SELECT status FROM jr_membership WHERE phone=?', (account,))
+            day = usage_date(now)
+            used = await one(c, 'SELECT query_count FROM jr_daily_usage WHERE phone=? AND usage_date=?', (account, day))
+            held = await one(c, 'SELECT COUNT(*) FROM query_tasks WHERE account=? AND usage_date=? AND reserved=1', (account, day))
+            if (not membership or membership[0] != 'member') and (used[0] if used else 0) + held[0] >= limit:
+                return False
+            await c.execute("UPDATE query_tasks SET account=?,usage_date=?,reserved=1,state='submitting',phase='submitting',updated_at=? WHERE task_id=?", (account, day, now, task))
+            return True
+
+    async def transition(self, task, state, reason='', *, sent_id=None, source_id=None):
+        async with self.db.transaction() as c:
+            await c.execute('UPDATE query_tasks SET state=?,phase=?,reason=?,updated_at=?,sent_id=COALESCE(?,sent_id),source_id=COALESCE(?,source_id),reserved=CASE WHEN ?=\'failed\' THEN 0 ELSE reserved END WHERE task_id=?',
+                            (state.value, state.value, reason, time.time(), sent_id, source_id, state.value, task))
+
+    async def complete(self, task, result, now, ttl, *, from_cache=False):
+        async with self.db.transaction() as c:
+            row = await one(c, 'SELECT * FROM query_tasks WHERE task_id=?', (task,))
+            if row['state'] == 'success':
+                return
+            account = row['account'] or ''
+            if row['reserved'] and not from_cache:
+                await c.execute('INSERT INTO jr_daily_usage VALUES(?,?,1) ON CONFLICT(phone,usage_date) DO UPDATE SET query_count=query_count+1', (account, row['usage_date']))
+                if result.export_status in ('member', 'free'):
+                    await c.execute('INSERT INTO jr_membership VALUES(?,?,?) ON CONFLICT(phone) DO UPDATE SET status=excluded.status,checked_at=excluded.checked_at', (account, result.export_status, now))
+            await c.execute("UPDATE query_tasks SET state='success',phase='complete',reason='',reserved=0,result_type=?,result_text=?,file_path=?,file_name=?,export_status=?,updated_at=? WHERE task_id=?",
+                            (result.kind, result.text, result.file_path, result.file_name, result.export_status, now, task))
+            if not from_cache:
+                await c.execute('INSERT INTO jr_result_cache(cache_key,result_text,source_phone,created_at,expires_at,result_type,file_path,file_name) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_text=excluded.result_text,source_phone=excluded.source_phone,created_at=excluded.created_at,expires_at=excluded.expires_at,result_type=excluded.result_type,file_path=excluded.file_path,file_name=excluded.file_name',
+                                (row['cache_key'], result.text, account, now, now + ttl, result.kind, result.file_path, result.file_name))
+
+    async def attach_file(self, task, path, name):
+        async with self.db.transaction() as c:
+            await c.execute('UPDATE query_tasks SET file_path=?,file_name=? WHERE task_id=?', (path, name, task))
+
+    async def delivery(self, task, state, cursor=None):
+        async with self.db.transaction() as c:
+            await c.execute('UPDATE query_tasks SET delivery_state=?,delivery_cursor=COALESCE(?,delivery_cursor),delivered_at=CASE WHEN ?=\'delivered\' THEN ? ELSE delivered_at END WHERE task_id=?',
+                            (state, cursor, state, time.time(), task))
+
+    async def recover(self):
+        """Keep intent/message IDs. Recovery NEVER submits or clicks again."""
+        async with self.db.transaction() as c:
+            await c.execute("UPDATE query_tasks SET state='failed',reason='restart_before_submission',reserved=0 WHERE state='prepared'")
+            await c.execute("UPDATE query_tasks SET phase=state,state='pending_review',reason='restart_after_intent' WHERE state IN ('submitting','submitted','purchasing','exporting','collecting','unknown')")
+            await c.execute("UPDATE query_tasks SET delivery_state='unknown' WHERE delivery_state='sending'")
+            async with c.execute("SELECT task_id,account,state,phase,delivery_state FROM query_tasks WHERE state IN ('pending_review','manual') OR delivery_state='unknown'") as cur:
+                return await cur.fetchall()
+
+    async def review(self, task, decision, reason):
+        if decision not in {'failed', 'success', 'manual'} or not reason.strip():
+            raise ValueError('需要人工核实结论和原因')
+        async with self.db.transaction() as c:
+            row = await one(c, 'SELECT * FROM query_tasks WHERE task_id=?', (task,))
+            if not row:
+                raise ValueError('任务不存在')
+            if row['state'] in ('success', 'failed'):
+                raise ValueError('任务已终结')
+            if decision == 'success' and row['reserved']:
+                await c.execute('INSERT INTO jr_daily_usage VALUES(?,?,1) ON CONFLICT(phone,usage_date) DO UPDATE SET query_count=query_count+1', (row['account'], row['usage_date']))
+            await c.execute('UPDATE query_tasks SET state=?,reason=?,reserved=CASE WHEN ?=\'manual\' THEN reserved ELSE 0 END,updated_at=? WHERE task_id=?', (decision, reason, decision, time.time(), task))
+===== END FILE: telegram_bot/storage/repositories/query_repository.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/user_repository.py =====
+class UserRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def is_banned(self, user_id):
+        return await self.db.fetchone('SELECT 1 FROM banned_users WHERE user_id=?', (user_id,)) is not None
+===== END FILE: telegram_bot/storage/repositories/user_repository.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/sql.py =====
+async def one(connection, sql, params=()):
+    """Fetch a row inside a repository-owned transaction, closing the cursor."""
+    async with connection.execute(sql, params) as cursor:
+        return await cursor.fetchone()
+===== END FILE: telegram_bot/storage/sql.py =====
+
+
+===== BEGIN FILE: telegram_bot/target_bots.py =====
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TargetBot:
+    name: str
+    bot: str
+    checkin_cmd: str
+    balance_cmd: str
+    balance_pattern: str
+    checkin_flow: str = 'simple_text'
+    success_keywords: tuple[str, ...] = ('签到成功', '已签到', '打卡成功')
+    balance_timeout: float = 20
+    checkin_timeout: float = 20
+    checkin_buttons: tuple[str, ...] = ()
+    balance_button: str = ''
+
+    @property
+    def key(self):
+        return self.bot.strip().casefold()
+
+
+TARGETS = (
+    TargetBot('中核验', '@zhonghybot', '/start', '/start', r'金币[🪙]?\s*[:：]\s*(\d+)',
+              'button_chain', ('签到成功', '获得', '当前金币', '金币'),
+              checkin_buttons=('获得金币', '签到')),
+    TargetBot('巨人', '@jrsgk', '/checkin', '/balance', r'积分余额[：:]\s*(\d+)'),
+    TargetBot('核武器', '@hewuqi', '/qd', '个人', r'盒能\s*[:：]\s*`?(\d+)`?', balance_timeout=60),
+)
+JR = TARGETS[1]
+MIN_INTERVAL = 86400
+RANDOM_OFFSET_MAX = 900
+JR_MAX_PAGES = 200
+JR_PAGE_TIMEOUT = 30
+JR_PAGE_INTERVAL = 1.0
+JR_POLL_INTERVAL = 0.8
+JR_BUY_AMOUNTS = (5, 10, 50)
+JR_NEXT_PAGE_KEYWORDS = ('下一页', '下页', '›', '»')
+JR_VERIFY_KEYWORDS = ('安全验证', '点击下图', '验证')
+JR_PENDING_KEYWORDS = ('正在查询', '查询中', '请稍候', '请稍等')
+JR_EXPORT_KEYWORDS = ('导出数据',)
+JR_FREE_EXPORT_KEYWORDS = ('免费用户暂不支持导出', '请充值后再使用')
+JR_EXPORT_SUCCESS_KEYWORDS = ('成功导出',)
+JR_FREE_DAILY_LIMIT = 5
+JR_MEMBERSHIP_RECHECK_INTERVAL = 86400
+OCR_MAX_ATTEMPTS = 3
+OCR_MIN_CONFIDENCE = 0.35
+OCR_IGNORE_BUTTON_KEYWORDS = ('刷新', '换一张', '看不清', '取消', '返回', '关闭',
+                              '购买', '首页', '上一页', '下一页', '尾页', '导出')
+===== END FILE: telegram_bot/target_bots.py =====
+
+
+===== BEGIN FILE: telegram_bot/utils/__init__.py =====
+
+===== END FILE: telegram_bot/utils/__init__.py =====
