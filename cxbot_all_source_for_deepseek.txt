@@ -2433,3 +2433,503 @@ class PaginationService:
 class ManualVerification(RuntimeError):
     pass
 ===== END FILE: telegram_bot/services/jr/pagination.py =====
+
+===== BEGIN FILE: telegram_bot/services/jr/result_parser.py =====
+import re
+from ...clients.dialogue import find_button, signature
+from ...target_bots import (JR_BUY_AMOUNTS, JR_NEXT_PAGE_KEYWORDS, JR_PENDING_KEYWORDS,
+                            JR_VERIFY_KEYWORDS, JR_EXPORT_KEYWORDS)
+
+JR_PAGE_RE = re.compile(r'[（(]?\s*第\s*(\d+)\s*页\s*[,，]\s*共\s*(\d+)\s*页\s*[）)]?', re.I)
+JR_TOTAL_HEADER_RE = re.compile(r'^\s*🔍️?\s*共\s*(\d+)\s*条信息\s*[:：]?\s*$', re.I)
+
+
+def is_jr_pending_message(message):
+    return any(k in (getattr(message, 'text', '') or '') for k in JR_PENDING_KEYWORDS)
+
+
+def find_buy_button(message):
+    generic = None
+    for r, row in enumerate(getattr(message, 'buttons', None) or []):
+        for c, b in enumerate(row):
+            text = b.text or ''
+            if '购买' in text:
+                generic = generic or (r, c, text)
+                if any(int(n) in JR_BUY_AMOUNTS for n in re.findall(r'\d+', text)):
+                    return r, c, text
+    return generic
+
+
+def find_next_page_button(message):
+    for r, row in enumerate(getattr(message, 'buttons', None) or []):
+        for c, b in enumerate(row):
+            if b.text == '下一页':
+                return r, c, b.text
+    return find_button(message, JR_NEXT_PAGE_KEYWORDS)
+
+
+def is_verification_message(message):
+    text = getattr(message, 'text', '') or ''
+    if '验证通过' in text:
+        return False
+    if any(k in text for k in JR_VERIFY_KEYWORDS):
+        return True
+    return bool(getattr(message, 'media', None) and getattr(message, 'buttons', None)
+                and not find_buy_button(message) and not find_next_page_button(message)
+                and not find_button(message, JR_EXPORT_KEYWORDS))
+
+
+def parse_page_info(message):
+    match = JR_PAGE_RE.search(getattr(message, 'text', '') or '')
+    if match:
+        current, total = map(int, match.groups())
+        if 0 < current <= total:
+            return current, total
+    return None
+
+
+def clean_page_text(message):
+    return JR_PAGE_RE.sub('', getattr(message, 'text', '') or '', count=1).strip()
+
+
+def page_content_signature(message):
+    return parse_page_info(message), clean_page_text(message), signature(message)[1]
+
+
+def classify(message):
+    if is_verification_message(message):
+        return 'manual'
+    if is_jr_pending_message(message):
+        return 'pending'
+    if getattr(message, 'document', None):
+        return 'result'
+    text = getattr(message, 'text', '') or ''
+    if any(k in text for k in ('积分不足', '余额不足', '查询失败')):
+        return 'failed'
+    if any(k in text for k in ('未查询到', '未找到', '无查询结果')):
+        return 'result'
+    if (find_buy_button(message) or parse_page_info(message)
+            or find_button(message, JR_EXPORT_KEYWORDS) or JR_TOTAL_HEADER_RE.search(text.splitlines()[0] if text else '')):
+        return 'result'
+    # Unknown text must not be charged, cached, or recorded as a successful result.
+    return 'unknown'
+
+
+def normalize_jr_full_result(text):
+    lines, header, blank = [], False, False
+    for raw in (text or '').replace('`', '').splitlines():
+        line = raw.rstrip()
+        if JR_TOTAL_HEADER_RE.match(line.strip()):
+            if header:
+                continue
+            header = True
+        if not line.strip():
+            if lines and not blank:
+                lines.append('')
+            blank = True
+            continue
+        lines.append(line)
+        blank = False
+    return '\n'.join(lines).strip()
+===== END FILE: telegram_bot/services/jr/result_parser.py =====
+
+
+===== BEGIN FILE: telegram_bot/services/jr/target_client.py =====
+import asyncio
+from ...clients.dialogue import signature
+from ...target_bots import JR, JR_PAGE_TIMEOUT
+from .result_parser import is_jr_pending_message
+
+
+class TargetClient:
+    def __init__(self, dialogue, cfg):
+        self.dialogue, self.cfg = dialogue, cfg
+
+    async def submit(self, client, text):
+        return await asyncio.wait_for(client.send_message(JR.bot, text), self.cfg.reply_timeout)
+
+    async def ready(self, client, after_id):
+        return await self.dialogue.wait(client, JR.bot, after_id,
+            lambda m: not is_jr_pending_message(m), self.cfg.reply_timeout)
+
+    async def click_and_wait(self, client, message, button):
+        old_signature = signature(message)
+        r, c, _ = button
+        await asyncio.wait_for(message.click(r, c), self.cfg.reply_timeout)
+        return await self.dialogue.wait(client, JR.bot, message.id,
+            lambda m: not is_jr_pending_message(m), JR_PAGE_TIMEOUT,
+            original=message, old_signature=old_signature)
+===== END FILE: telegram_bot/services/jr/target_client.py =====
+
+
+===== BEGIN FILE: telegram_bot/services/login_service.py =====
+"""Private admin login. Codes/passwords are transient arguments, never persisted."""
+import asyncio
+import re
+import time
+import logging
+from dataclasses import dataclass, field
+from collections import deque
+from telethon.errors import (SessionPasswordNeededError, FloodWaitError,
+                              PhoneMigrateError, NetworkMigrateError, UserMigrateError)
+
+
+@dataclass(repr=False)
+class LoginAttempt:
+    expires: float
+    phase: str = 'phone'
+    phone: str = ''
+    code_hash: str = field(default='', repr=False)
+    client: object = field(default=None, repr=False)
+
+
+class LoginService:
+    def __init__(self, cfg, manager, on_added):
+        self.cfg, self.manager, self.on_added = cfg, manager, on_added
+        self.attempts = {}
+        self.lock = asyncio.Lock()
+        self.cooldown_until = 0
+        self.seen_updates = deque(maxlen=512)
+
+    def allowed(self, user, chat, private):
+        return private and user == self.cfg.admin_id and chat == user
+
+    async def _drop(self, actor):
+        attempt = self.attempts.pop(actor, None)
+        if attempt and attempt.client:
+            try:
+                await asyncio.wait_for(attempt.client.disconnect(), self.cfg.reply_timeout)
+            except Exception:
+                # Cleanup failure must never expose the RPC exception or credential.
+                return
+
+    async def begin(self, user, chat, private):
+        if not self.allowed(user, chat, private):
+            return '登录仅限管理员私聊。'
+        async with self.lock:
+            if time.time() < self.cooldown_until:
+                return 'Telegram 限流冷却中，请稍后再试。'
+            old = self.attempts.get(user)
+            if old and time.monotonic() < old.expires:
+                return '已有登录流程，请继续输入或先 /cancel。'
+            await self._drop(user)
+            self.attempts[user] = LoginAttempt(time.monotonic() + self.cfg.login_ttl)
+            return '请输入国际格式手机号（例如 +8613800000000）。流程限时 5 分钟，可用 /cancel 退出。验证码和密码输入后将尝试删除消息；机器人私聊不是端到端加密。'
+
+    async def cancel(self, user, chat, private):
+        if not self.allowed(user, chat, private):
+            return '登录仅限管理员私聊。'
+        async with self.lock:
+            await self._drop(user)
+        return '登录已取消。'
+
+    async def submit(self, user, chat, private, value, request_id=None):
+        if not self.allowed(user, chat, private):
+            return '登录仅限管理员私聊。'
+        async with self.lock:
+            if request_id is not None:
+                if request_id in self.seen_updates:
+                    return None
+                self.seen_updates.append(request_id)
+            attempt = self.attempts.get(user)
+            if not attempt:
+                return None
+            if time.monotonic() >= attempt.expires:
+                await self._drop(user)
+                return '登录已超时，请重新 /login。'
+            try:
+                return await asyncio.wait_for(self._step(attempt, value),
+                    min(self.cfg.reply_timeout, max(0.01, attempt.expires - time.monotonic())))
+            except SessionPasswordNeededError:
+                attempt.phase = 'password'
+                return '账号启用了两步验证，请输入密码；或 /cancel 退出。'
+            except FloodWaitError as error:
+                self.cooldown_until = time.time() + max(1, error.seconds)
+                await self._drop(user)
+                return 'Telegram 要求等待，登录已退出；冷却结束后重新 /login。'
+            except asyncio.CancelledError:
+                await self._drop(user)
+                raise
+            except Exception as error:
+                logging.getLogger(__name__).warning('Login failed phase=%s error_type=%s',
+                    attempt.phase, type(error).__name__)
+                reasons = {
+                    'PhoneCodeInvalidError': '验证码错误',
+                    'PhoneCodeExpiredError': '验证码已过期',
+                    'PasswordHashInvalidError': '两步验证密码错误',
+                    'PhoneNumberInvalidError': '手机号无效',
+                    'PhoneNumberBannedError': '该号码被 Telegram 限制',
+                    'TimeoutError': '连接或流程超时，外部登录结果需核实',
+                    'FileExistsError': 'Session 已存在，未覆盖',
+                    'ApiIdInvalidError': 'API_ID 与 API_HASH 无效或不匹配，请在服务器本地核对',
+                    'PhoneNumberFloodError': '该号码登录请求过多，请停止重试并等待 Telegram 限制解除',
+                    'AuthRestartError': 'Telegram 要求重新开始授权，请先停止当前尝试',
+                    'ConnectionError': '连接 Telegram 失败',
+                }
+                reason = reasons.get(type(error).__name__, '当前步骤的格式、连接、保存或授权验证失败')
+                if isinstance(error, ValueError) and attempt.phase == 'phone' and attempt.client is None:
+                    reason = '手机号格式无效，请使用加号和国际区号加数字，不含空格或其他字符'
+                await self._drop(user)
+                return f'登录未完成：{reason}，已退出。请重新 /login。若已保存 Session，可通过 /status 或重启核实。'
+            finally:
+                value = None
+
+    async def _step(self, attempt, value):
+        if attempt.phase == 'phone':
+            if not re.fullmatch(r'\+?[1-9][0-9]{6,14}', value.strip()):
+                raise ValueError('invalid_phone')
+            attempt.phone = value.strip().lstrip('+')
+            if self.manager.exists(attempt.phone):
+                await self._drop(self.cfg.admin_id)
+                return '该账号已存在 Session，禁止覆盖；请使用 /status 查看状态。'
+            attempt.client = self.manager.login_client()
+            await attempt.client.connect()
+            try:
+                response = await attempt.client.send_code_request('+' + attempt.phone)
+            except (PhoneMigrateError, NetworkMigrateError, UserMigrateError):
+                # Telethon has already switched to the DC explicitly required by
+                # Telegram. No code was sent on the rejected DC. Retry only once;
+                # never repeat on timeouts, server errors or rate limits.
+                logging.getLogger(__name__).info('Login DC routing updated; one directed retry')
+                response = await attempt.client.send_code_request('+' + attempt.phone)
+            attempt.code_hash = response.phone_code_hash
+            attempt.phase = 'code'
+            return '请输入 Telegram 登录验证码；如验证码被 Telegram 判定为转发而失效，请取消后使用服务器本地登录。'
+        if attempt.phase == 'code':
+            code = re.sub(r'[\s-]', '', value)
+            if not re.fullmatch(r'[0-9]{4,8}', code):
+                raise ValueError('invalid_code')
+            await attempt.client.sign_in(phone='+' + attempt.phone, code=code, phone_code_hash=attempt.code_hash)
+        else:
+            await attempt.client.sign_in(password=value)
+        if not await attempt.client.is_user_authorized():
+            raise ValueError('not_authorized')
+        me = await attempt.client.get_me()
+        if str(getattr(me, 'phone', '')).lstrip('+') != attempt.phone:
+            raise ValueError('account_mismatch')
+        session = attempt.client.session
+        await attempt.client.disconnect()
+        attempt.client = None
+        account = await self.manager.enroll(attempt.phone, session)
+        await self._drop(self.cfg.admin_id)
+        self.on_added()
+        return f'登录成功：{account.key}；Session 已安全保存并重新连接验证，已纳入账号管理。'
+
+    async def expire(self):
+        async with self.lock:
+            for actor, attempt in tuple(self.attempts.items()):
+                if time.monotonic() >= attempt.expires:
+                    await self._drop(actor)
+
+    async def loop(self):
+        while True:
+            await asyncio.sleep(5)
+            await self.expire()
+
+    async def close(self):
+        async with self.lock:
+            for actor in tuple(self.attempts):
+                await self._drop(actor)
+===== END FILE: telegram_bot/services/login_service.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/__init__.py =====
+
+===== END FILE: telegram_bot/storage/__init__.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/database.py =====
+import asyncio
+import sqlite3
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+import aiosqlite
+
+
+class Database:
+    """One connection, one transaction lock; no cursor leaks or implicit commits."""
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.connection = None
+        self.lock = asyncio.Lock()
+        self.backup_path = None
+
+    async def open(self):
+        from .migrations import migrate, validate_legacy
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        existed = self.path.exists() and self.path.stat().st_size > 0
+        self.connection = await aiosqlite.connect(self.path, isolation_level=None)
+        self.connection.row_factory = sqlite3.Row
+        try:
+            await self.connection.execute('PRAGMA busy_timeout=10000')
+            await validate_legacy(self.connection)
+            if existed:
+                self.backup_path = self.path.with_name(
+                    self.path.name + f'.backup-{int(time.time())}-{uuid.uuid4().hex[:8]}')
+                with sqlite3.connect(self.backup_path) as destination:
+                    await self.connection.backup(destination)
+            await self.connection.execute('PRAGMA journal_mode=WAL')
+            await self.connection.execute('PRAGMA synchronous=FULL')
+            await self.connection.execute('PRAGMA foreign_keys=ON')
+            await migrate(self)
+        except BaseException:
+            await self.close()
+            raise
+        return self
+
+    @asynccontextmanager
+    async def transaction(self):
+        async with self.lock:
+            try:
+                await self.connection.execute('BEGIN IMMEDIATE')
+                yield self.connection
+                await self.connection.commit()
+            except BaseException:
+                await self.connection.rollback()
+                raise
+
+    async def fetchone(self, sql, params=()):
+        async with self.lock:
+            async with self.connection.execute(sql, params) as cursor:
+                return await cursor.fetchone()
+
+    async def fetchall(self, sql, params=()):
+        async with self.lock:
+            async with self.connection.execute(sql, params) as cursor:
+                return await cursor.fetchall()
+
+    async def close(self):
+        async with self.lock:
+            if self.connection:
+                await self.connection.close()
+                self.connection = None
+===== END FILE: telegram_bot/storage/database.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/migrations.py =====
+from .sql import one
+from ..target_bots import TARGETS
+
+
+class SchemaError(ValueError):
+    """Safe startup diagnostic containing internal schema names only."""
+    pass
+
+
+LEGACY_COLUMNS = {
+    'last_sign_time': {'phone', 'timestamp'},
+    'jr_membership': {'phone', 'status', 'checked_at'},
+    'jr_daily_usage': {'phone', 'usage_date', 'query_count'},
+    'jr_result_cache': {'cache_key', 'result_text', 'source_phone', 'created_at', 'expires_at'},
+    'banned_users': {'user_id', 'reason', 'banned_at'},
+}
+
+
+async def columns(conn, table):
+    # Only constant internal table names reach this function.
+    async with conn.execute(f'PRAGMA table_info({table})') as cur:
+        return await cur.fetchall()
+
+
+async def validate_legacy(conn):
+    async with conn.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
+        tables = {row[0] for row in await cur.fetchall()}
+    allowed = set(LEGACY_COLUMNS) | {'schema_migrations', 'checkin_state', 'checkin_attempts',
+                                     'query_tasks', 'file_leases', 'account_cooldowns'}
+    unknown = {t for t in tables if not t.startswith('sqlite_')} - allowed
+    if unknown:
+        raise SchemaError('数据库包含未知表；停止迁移，请人工审核结构')
+    for table, required in LEGACY_COLUMNS.items():
+        if table not in tables:
+            continue
+        info = await columns(conn, table)
+        if not required <= {r[1] for r in info}:
+            raise SchemaError(f'{table} 结构不兼容；停止迁移')
+        optional = {'last_sign_time': {'bot'}, 'jr_result_cache': {'result_type', 'file_path', 'file_name'}}
+        if {r[1] for r in info} - required - optional.get(table, set()):
+            raise SchemaError(f'{table} 存在未知字段；停止迁移')
+        pk = [r[1] for r in sorted(info, key=lambda r: r[5]) if r[5]]
+        expected = {'jr_membership': ['phone'], 'jr_daily_usage': ['phone', 'usage_date'],
+                    'jr_result_cache': ['cache_key'], 'banned_users': ['user_id']}
+        if table == 'last_sign_time':
+            if pk not in (['phone'], ['phone', 'bot']):
+                raise SchemaError('last_sign_time 主键不兼容')
+        elif pk != expected[table]:
+            raise SchemaError(f'{table} 主键不兼容')
+    if 'schema_migrations' in tables:
+        row = await one(conn, 'SELECT MAX(version) FROM schema_migrations')
+        if row[0] is not None and row[0] > 1:
+            raise SchemaError('数据库版本高于当前程序，禁止降级运行')
+        expected = {
+            'schema_migrations': {'version'},
+            'checkin_state': {'phone','bot','last_attempt','last_success','next_at','outcome','error_type','reason'},
+            'checkin_attempts': {'id','phone','bot','attempted_at','outcome','error_type','reason'},
+            'query_tasks': {'task_id','request_id','cache_key','account','state','phase','created_at','updated_at','usage_date','reason','sent_id','source_id','result_type','result_text','file_path','file_name','export_status','delivery_state','delivery_cursor','delivered_at','reserved'},
+            'file_leases': {'path','owner'},
+            'account_cooldowns': {'phone','until_at'},
+        }
+        for table, required in expected.items():
+            if table not in tables or {r[1] for r in await columns(conn, table)} != required:
+                raise SchemaError(f'{table} V2 结构不兼容；停止迁移')
+
+
+async def migrate(db):
+    async with db.transaction() as conn:
+        await conn.execute('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)')
+        info = await columns(conn, 'last_sign_time')
+        pk = [r[1] for r in sorted(info, key=lambda r: r[5]) if r[5]]
+        if info and pk != ['phone', 'bot']:
+            await conn.execute('ALTER TABLE last_sign_time RENAME TO last_sign_time_legacy_v1')
+            await conn.execute('CREATE TABLE last_sign_time (phone TEXT NOT NULL, bot TEXT NOT NULL, '
+                               'timestamp REAL NOT NULL, PRIMARY KEY(phone,bot))')
+            if 'bot' in {r[1] for r in info}:
+                await conn.execute('INSERT INTO last_sign_time SELECT phone,lower(trim(bot)),timestamp '
+                                   'FROM last_sign_time_legacy_v1 WHERE bot IS NOT NULL AND timestamp IS NOT NULL')
+            else:
+                for target in TARGETS:
+                    await conn.execute('INSERT INTO last_sign_time SELECT phone,?,timestamp '
+                                       'FROM last_sign_time_legacy_v1 WHERE timestamp IS NOT NULL', (target.key,))
+            await conn.execute('DROP TABLE last_sign_time_legacy_v1')
+        statements = [
+            'CREATE TABLE IF NOT EXISTS last_sign_time (phone TEXT NOT NULL,bot TEXT NOT NULL,timestamp REAL NOT NULL,PRIMARY KEY(phone,bot))',
+            "CREATE TABLE IF NOT EXISTS jr_membership (phone TEXT PRIMARY KEY,status TEXT NOT NULL CHECK(status IN ('member','free')),checked_at REAL NOT NULL)",
+            'CREATE TABLE IF NOT EXISTS jr_daily_usage (phone TEXT NOT NULL,usage_date TEXT NOT NULL,query_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(phone,usage_date))',
+            "CREATE TABLE IF NOT EXISTS jr_result_cache (cache_key TEXT PRIMARY KEY,result_text TEXT NOT NULL,source_phone TEXT NOT NULL,created_at REAL NOT NULL,expires_at REAL NOT NULL,result_type TEXT NOT NULL DEFAULT 'text',file_path TEXT,file_name TEXT)",
+            'CREATE TABLE IF NOT EXISTS banned_users (user_id INTEGER PRIMARY KEY,reason TEXT NOT NULL,banned_at REAL NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS checkin_state (phone TEXT NOT NULL,bot TEXT NOT NULL,last_attempt REAL,last_success REAL,next_at REAL NOT NULL,outcome TEXT NOT NULL,error_type TEXT NOT NULL DEFAULT \'\',reason TEXT NOT NULL DEFAULT \'\',PRIMARY KEY(phone,bot))',
+            'CREATE TABLE IF NOT EXISTS checkin_attempts (id INTEGER PRIMARY KEY,phone TEXT NOT NULL,bot TEXT NOT NULL,attempted_at REAL NOT NULL,outcome TEXT NOT NULL,error_type TEXT NOT NULL,reason TEXT NOT NULL)',
+            "CREATE TABLE IF NOT EXISTS query_tasks (task_id TEXT PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,cache_key TEXT NOT NULL,account TEXT,state TEXT NOT NULL,phase TEXT NOT NULL,created_at REAL NOT NULL,updated_at REAL NOT NULL,usage_date TEXT,reason TEXT NOT NULL DEFAULT '',sent_id INTEGER,source_id INTEGER,result_type TEXT,result_text TEXT,file_path TEXT,file_name TEXT,export_status TEXT,delivery_state TEXT NOT NULL DEFAULT 'not_started',delivery_cursor INTEGER NOT NULL DEFAULT 0,delivered_at REAL,reserved INTEGER NOT NULL DEFAULT 0)",
+            'CREATE TABLE IF NOT EXISTS file_leases (path TEXT NOT NULL,owner TEXT NOT NULL,PRIMARY KEY(path,owner))',
+            'CREATE TABLE IF NOT EXISTS account_cooldowns (phone TEXT PRIMARY KEY,until_at REAL NOT NULL)',
+            'CREATE INDEX IF NOT EXISTS idx_jr_result_cache_expires ON jr_result_cache(expires_at)',
+            'CREATE INDEX IF NOT EXISTS idx_query_tasks_key ON query_tasks(cache_key,state)',
+        ]
+        for statement in statements:
+            await conn.execute(statement)
+        existing = {r[1] for r in await columns(conn, 'jr_result_cache')}
+        for name, definition in [('result_type', "TEXT NOT NULL DEFAULT 'text'"), ('file_path', 'TEXT'), ('file_name', 'TEXT')]:
+            if name not in existing:
+                await conn.execute(f'ALTER TABLE jr_result_cache ADD COLUMN {name} {definition}')
+        await conn.execute('INSERT OR IGNORE INTO schema_migrations VALUES (1)')
+===== END FILE: telegram_bot/storage/migrations.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/__init__.py =====
+
+===== END FILE: telegram_bot/storage/repositories/__init__.py =====
+
+
+===== BEGIN FILE: telegram_bot/storage/repositories/account_repository.py =====
+class AccountRepository:
+    def __init__(self, db):
+        self.db = db
+
+    async def cooldowns(self):
+        return await self.db.fetchall('SELECT phone,until_at FROM account_cooldowns')
+
+    async def set_cooldown(self, account, until):
+        async with self.db.transaction() as c:
+            await c.execute('INSERT INTO account_cooldowns VALUES(?,?) ON CONFLICT(phone) DO UPDATE SET until_at=MAX(until_at,excluded.until_at)', (account, until))
+===== END FILE: telegram_bot/storage/repositories/account_repository.py =====
