@@ -1747,3 +1747,218 @@ class AccountSelector:
         return sorted((item for item in results if item and item[1].outcome == Outcome.SUCCESS),
                       key=lambda item: -item[1].value)
 ===== END FILE: telegram_bot/services/jr/account_selector.py =====
+
+===== BEGIN FILE: telegram_bot/services/jr/cache_service.py =====
+import asyncio
+import hashlib
+import logging
+import re
+import time
+from ...models.query import JRQueryResult
+from ...utils.paths import confined
+
+log = logging.getLogger(__name__)
+
+
+def normalize_jr_query(text):
+    return re.sub(r'\s+', ' ', (text or '').strip()).casefold()
+
+
+def jr_cache_key(text):
+    return hashlib.sha256(normalize_jr_query(text).encode('utf-8')).hexdigest()
+
+
+class CacheInconsistent(RuntimeError):
+    pass
+
+
+class CacheService:
+    def __init__(self, cfg, repository):
+        self.cfg, self.repository = cfg, repository
+        self.lock = asyncio.Lock()
+
+    async def get(self, key):
+        # Caller holds lock until durable task references have been written.
+        row = await self.repository.get(key, time.time())
+        if not row:
+            return None
+        if row['result_type'] not in {'file', 'text'}:
+            raise CacheInconsistent('invalid_cache_kind')
+        if row['result_type'] == 'file':
+            try:
+                path = confined(self.cfg.cache, row['file_path'] or '')
+                if not path.is_file():
+                    raise ValueError
+            except (OSError, ValueError):
+                raise CacheInconsistent('cached_file_missing_or_outside_root') from None
+        return JRQueryResult(row['result_type'], row['result_text'], row['file_path'], row['file_name'])
+
+    async def cleanup(self, now=None):
+        now = time.time() if now is None else now
+        async with self.lock:
+            active_paths = await self.repository.expire_and_references(now, self.cfg.cache_ttl)
+            active = set()
+            for raw in active_paths:
+                try:
+                    active.add(confined(self.cfg.cache, raw))
+                except (ValueError, OSError):
+                    log.warning('Ignored out-of-root cache reference')
+            if not self.cfg.cache.is_dir():
+                return 0
+            deleted = 0
+            for candidate in self.cfg.cache.rglob('*'):
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                try:
+                    path = confined(self.cfg.cache, candidate)
+                    if path not in active and now - path.stat().st_mtime >= self.cfg.cache_ttl:
+                        path.unlink()
+                        deleted += 1
+                except (OSError, ValueError):
+                    log.warning('Cache cleanup skipped one unsafe/unavailable file')
+            for directory in sorted(self.cfg.cache.rglob('*'), key=lambda p: len(p.parts), reverse=True):
+                if directory.is_dir() and not directory.is_symlink():
+                    try:
+                        confined(self.cfg.cache, directory).rmdir()
+                    except OSError:
+                        # Only empty directories are removable; occupied directories are expected.
+                        continue
+            return deleted
+
+    async def loop(self):
+        while True:
+            await asyncio.sleep(self.cfg.cleanup_interval)
+            try:
+                await self.cleanup()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                log.error('Cache cleanup error_type=%s', type(error).__name__)
+===== END FILE: telegram_bot/services/jr/cache_service.py =====
+
+
+===== BEGIN FILE: telegram_bot/services/jr/export_service.py =====
+import asyncio
+import logging
+import re
+import uuid
+from pathlib import Path
+from ...clients.dialogue import find_button
+from ...models.query import JRQueryResult
+from ...models.enums import QueryState
+from ...target_bots import JR, JR_EXPORT_KEYWORDS, JR_FREE_EXPORT_KEYWORDS, JR_EXPORT_SUCCESS_KEYWORDS
+from ...utils.paths import confined
+from ...utils.message_format import split_text_by_lines
+from .result_parser import normalize_jr_full_result
+
+log = logging.getLogger(__name__)
+
+
+def jr_original_file_name(message):
+    name = (getattr(getattr(message, 'file', None), 'name', '') or '').strip()
+    name = re.split(r'[\\/]', name)[-1].strip()
+    return re.sub(r'[\x00-\x1f]', '_', name) or f'jr_export_{message.id}.bin'
+
+
+def jr_message_matches_export_request(message, *, baseline_id, query_after_id, target_bot_id=None):
+    if getattr(message, 'out', False) or message.id <= max(baseline_id, query_after_id):
+        return False
+    sender = getattr(message, 'sender_id', None)
+    if sender is not None and target_bot_id is not None and sender != target_bot_id:
+        return False
+    reply_id = getattr(message, 'reply_to_msg_id', None)
+    if reply_id is None:
+        reply_id = getattr(getattr(message, 'reply_to', None), 'reply_to_msg_id', None)
+    if reply_id is not None and reply_id < query_after_id:
+        return False
+    return bool(getattr(message, 'document', None) or (getattr(message, 'file', None) and getattr(message, 'media', None)))
+
+
+class ExportService:
+    def __init__(self, cfg, dialogue, queries, cache, bot=None):
+        self.cfg, self.dialogue, self.queries, self.cache = cfg, dialogue, queries, cache
+        self.bot = bot
+
+    async def download(self, task, client, message):
+        name = jr_original_file_name(message)
+        # Fixed disk basename avoids both POSIX traversal and Windows reserved device names.
+        async with self.cache.lock:
+            path = confined(self.cfg.cache, self.cfg.cache / uuid.uuid4().hex / 'result.bin')
+            path.parent.mkdir(parents=True, exist_ok=False)
+            await self.queries.attach_file(task, str(path), name)
+        downloaded = await asyncio.wait_for(client.download_media(message, file=str(path)), self.cfg.export_timeout)
+        actual = confined(self.cfg.cache, downloaded or path)
+        if actual != path or not actual.is_file():
+            raise FileNotFoundError('download_missing_or_unexpected_path')
+        return JRQueryResult('file', file_path=str(path), file_name=name, export_status='member')
+
+    async def attempt(self, task, client, message, query_after_id):
+        if getattr(message, 'document', None):
+            return await self.download(task, client, message), 'member', ''
+        button = find_button(message, JR_EXPORT_KEYWORDS)
+        if not button:
+            return None, 'unknown', 'export_button_missing'
+        before = await self.dialogue.messages(client, JR.bot, limit=1)
+        baseline = max([message.id, *(m.id for m in before)])
+        await self.queries.transition(task, QueryState.EXPORTING, source_id=message.id)
+        r, c, _ = button
+        answer = await asyncio.wait_for(message.click(r, c), self.cfg.reply_timeout)
+        feedback = getattr(answer, 'message', '') or ''
+        if any(k in feedback for k in JR_FREE_EXPORT_KEYWORDS):
+            return None, 'free', 'free_export_unavailable'
+        success_seen = any(k in feedback for k in JR_EXPORT_SUCCESS_KEYWORDS)
+
+        def accepted(candidate):
+            nonlocal success_seen
+            text = getattr(candidate, 'text', '') or ''
+            if any(k in text for k in JR_EXPORT_SUCCESS_KEYWORDS):
+                success_seen = True
+            return (any(k in text for k in JR_FREE_EXPORT_KEYWORDS)
+                    or jr_message_matches_export_request(candidate, baseline_id=baseline, query_after_id=query_after_id,
+                                                         target_bot_id=getattr(message, 'sender_id', None)))
+        candidate = await self.dialogue.wait(client, JR.bot, baseline, accepted, self.cfg.export_timeout)
+        if candidate and any(k in (getattr(candidate, 'text', '') or '') for k in JR_FREE_EXPORT_KEYWORDS):
+            return None, 'free', 'free_export_unavailable'
+        if candidate:
+            try:
+                return await self.download(task, client, candidate), 'member', ''
+            except (OSError, TimeoutError) as error:
+                log.warning('Export download failed task=%s error_type=%s', task, type(error).__name__)
+                return None, 'member', 'export_download_failed'
+        return None, 'member' if success_seen else 'unknown', 'export_file_timeout'
+
+    async def deliver(self, task, result):
+        """Record intent before every send; ambiguous delivery never auto-retries."""
+        row = await self.queries.get(task)
+        if row['delivery_state'] != 'not_started':
+            return row['delivery_state']
+        async with self.cache.lock:
+            await self.queries.delivery(task, 'sending', 0)
+            try:
+                if result.kind == 'file':
+                    path = confined(self.cfg.cache, result.file_path or '')
+                    with path.open('rb') as stream:
+                        await self.bot.send_document(chat_id=self.cfg.admin_id, document=stream, filename=result.file_name)
+                    await self.queries.delivery(task, 'delivered', 1)
+                else:
+                    cleaned = normalize_jr_full_result(result.text)
+                    if not cleaned:
+                        raise ValueError('empty_result')
+                    pieces = split_text_by_lines(cleaned, limit=3600)
+                    for index, piece in enumerate(pieces):
+                        title = '✅ 巨人查询完成' if index == 0 else f'—— 续 {index + 1}/{len(pieces)} ——'
+                        await self.bot.send_message(chat_id=self.cfg.admin_id, text=f'{title}\n\n{piece}')
+                        await self.queries.delivery(task, 'sending', index + 1)
+                    await self.queries.delivery(task, 'delivered', len(pieces))
+                return 'delivered'
+            except BaseException:
+                await self.queries.delivery(task, 'unknown')
+                raise
+
+    async def notify(self, task, state, reason):
+        try:
+            await self.bot.send_message(chat_id=self.cfg.admin_id,
+                text=f'⚠️ JR 任务 {task}\n状态：{state}\n原因：{reason}\n请核实目标机器人记录；系统不会自动重做。')
+        except Exception as error:
+            log.error('Admin notification failed task=%s error_type=%s', task, type(error).__name__)
+===== END FILE: telegram_bot/services/jr/export_service.py =====
