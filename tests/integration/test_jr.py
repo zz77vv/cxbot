@@ -1,7 +1,7 @@
 import asyncio
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 import pytest
 from conftest import message,button
 from telegram_bot.storage.repositories.query_repository import QueryRepository
@@ -13,6 +13,8 @@ from telegram_bot.services.jr.pagination import PaginationService
 from telegram_bot.models.account import OperationResult
 from telegram_bot.models.enums import Outcome,QueryState
 from telegram_bot.models.query import JRQueryResult
+from telegram_bot.services.jr.ocr_service import OCRService
+from telegram_bot.services.jr.verification_service import VerificationService, VerificationError
 
 
 @pytest.fixture
@@ -25,7 +27,10 @@ def setup_jr(cfg,db,manager,bot):
         ready=AsyncMock(return_value=message('🔍共1条信息\nfixture result')),
         click_and_wait=AsyncMock(return_value=message('🔍共1条信息\nfixture result',id=12)))
     exports=ExportService(cfg,SimpleNamespace(),queries,cache,bot)
-    orchestrator=Orchestrator(manager,queries,selector,target,PaginationService(target),exports,cache)
+    ocr=create_autospec(OCRService,instance=True)
+    ocr.recognize_captcha.side_effect=VerificationError('mock_recognition_failed')
+    verification=VerificationService(ocr,SimpleNamespace(wait=AsyncMock()),target,cfg)
+    orchestrator=Orchestrator(manager,queries,selector,target,PaginationService(target),exports,cache,verification)
     return orchestrator,queries,target,exports,cache
 
 
@@ -89,14 +94,42 @@ async def test_unknown_reply_is_not_success(setup_jr,db):
     assert await db.fetchone('SELECT * FROM jr_result_cache') is None
 
 
-async def test_security_verification_stops_for_human(setup_jr):
+async def test_security_verification_stops_for_human(setup_jr,client):
     jr,repo,target,*_=setup_jr
     verification=message('安全验证',buttons=[[button('字')]],media=True)
     target.ready.return_value=verification
+    client.download_media.return_value=b'fixture image'
     report=await jr.execute('u1','fixture')
     assert report.state==QueryState.MANUAL
     verification.click.assert_not_awaited()
     assert target.submit.await_count==1
+    assert report.reason=='verification_failed:mock_recognition_failed'
+    assert (await repo.get(report.task_id))['state']=='manual'
+    await jr.execute('u2','fixture')
+    assert target.submit.await_count==1
+
+
+async def test_verification_resubmits_and_exports_with_new_id(setup_jr,client,db):
+    jr,repo,target,exports,*_=setup_jr
+    prompt=message('点击下图',buttons=[[button('取消'),button('字')]],media=True)
+    client.download_media.return_value=b'fixture image'
+    jr.verification.ocr.recognize_captcha.side_effect=None
+    jr.verification.ocr.recognize_captcha.return_value=(1,'字',0.9)
+    jr.verification.dialogue.wait.return_value=message('验证通过',id=12)
+    target.submit.side_effect=[message(id=10),message(id=20)]
+    target.ready.side_effect=[prompt,message('🔍共1条信息\nfixture result',id=21)]
+    exports.attempt=AsyncMock(return_value=(None,'none','no_export_button'))
+    report=await jr.execute('u1','fixture')
+    assert report.state==QueryState.SUCCESS
+    prompt.click.assert_awaited_once_with(0,1)
+    assert target.submit.await_count==2
+    assert [c.args[1] for c in target.submit.await_args_list]==['fixture','fixture']
+    assert target.ready.await_args.args[1]==20
+    assert exports.attempt.await_args.args[3]==20
+    assert (await repo.get(report.task_id))['sent_id']==20
+    assert (await db.fetchone('SELECT query_count FROM jr_daily_usage'))[0]==1
+    await jr.execute('u2','fixture')
+    assert target.submit.await_count==2
 
 
 async def test_explicit_failure_releases_reservation(setup_jr,db):

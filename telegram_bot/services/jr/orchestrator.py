@@ -11,14 +11,16 @@ from .cache_service import jr_cache_key, CacheInconsistent
 from .account_selector import RateLimitEncountered
 from .pagination import ManualVerification
 from .result_parser import classify, find_buy_button
+from .verification_service import VerificationError
 
 log = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self, manager, repository, selector, target, pagination, exports, cache):
+    def __init__(self, manager, repository, selector, target, pagination, exports, cache, verification):
         self.manager, self.repository, self.selector = manager, repository, selector
         self.target, self.pagination, self.exports, self.cache = target, pagination, exports, cache
+        self.verification = verification
         self.locks = KeyedLocks()
         self.accepting = True
         self.active = set()
@@ -41,6 +43,7 @@ class Orchestrator:
             self.active.discard(current_task)
 
     async def _run(self, task, text):
+        cached = None
         try:
             async with self.cache.lock:
                 cached = await self.cache.get(jr_cache_key(text))
@@ -59,6 +62,7 @@ class Orchestrator:
                     await self.repository.transition(task, QueryState.FAILED, 'account_busy_or_daily_limit')
                     return QueryReport(task, QueryState.FAILED, 'account_busy_or_daily_limit')
                 sent = await self.target.submit(client, text)
+                query_after_id = sent.id
                 await self.repository.transition(task, QueryState.SUBMITTED, sent_id=sent.id)
                 reply = await self.target.ready(client, sent.id)
                 if not reply:
@@ -66,7 +70,13 @@ class Orchestrator:
                 await self.repository.transition(task, QueryState.SUBMITTED, source_id=reply.id)
                 kind = classify(reply)
                 if kind == 'manual':
-                    return await self._hold(task, QueryState.MANUAL, 'security_verification_requires_human')
+                    try:
+                        reply, query_after_id = await self.verification.solve(client, reply, text)
+                    except VerificationError as error:
+                        return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}')
+                    await self.repository.transition(task, QueryState.SUBMITTED,
+                                                     sent_id=query_after_id, source_id=reply.id)
+                    kind = classify(reply)
                 if kind == 'failed':
                     await self.repository.transition(task, QueryState.FAILED, 'explicit_target_failure')
                     return QueryReport(task, QueryState.FAILED, 'explicit_target_failure')
@@ -82,7 +92,7 @@ class Orchestrator:
                         return await self._hold(task, QueryState.MANUAL, 'verification_after_purchase')
                     if classify(reply) != 'result' or find_buy_button(reply):
                         return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_not_confirmed')
-                exported, status, reason = await self.exports.attempt(task, client, reply, sent.id)
+                exported, status, reason = await self.exports.attempt(task, client, reply, query_after_id)
                 if exported:
                     result = exported
                 else:
