@@ -628,3 +628,457 @@ class BotApplication:
             except Exception as error:
                 log.warning('Bot close stage=%s error_type=%s', name, type(error).__name__)
 ===== END FILE: telegram_bot/clients/bot_application.py =====
+
+===== BEGIN FILE: telegram_bot/clients/dialogue.py =====
+import asyncio
+import time
+from ..utils.retry import retry_safe
+
+
+def signature(message):
+    return (getattr(message, 'text', '') or '',
+            tuple(tuple(getattr(b, 'text', '') for b in row) for row in (getattr(message, 'buttons', None) or [])),
+            str(getattr(message, 'edit_date', None)))
+
+
+def find_button(message, keywords):
+    for r, row in enumerate(getattr(message, 'buttons', None) or []):
+        for c, button in enumerate(row):
+            label = getattr(button, 'text', '') or ''
+            if any(key in label for key in keywords):
+                return r, c, label
+    return None
+
+
+class Dialogue:
+    """Read-only bounded polling shared by check-in, balance and JR."""
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    async def messages(self, client, bot, **kwargs):
+        return await retry_safe(lambda: asyncio.wait_for(client.get_messages(bot, **kwargs), self.cfg.reply_timeout),
+                                attempts=self.cfg.retry_attempts, base=self.cfg.retry_base)
+
+    async def wait(self, client, bot, after_id, predicate, timeout, *, original=None, old_signature=None, interval=0.8):
+        async def poll():
+            while True:
+                if original is not None:
+                    refreshed = await self.messages(client, bot, ids=original.id)
+                    if (refreshed and not getattr(refreshed, 'out', False)
+                            and signature(refreshed) != old_signature and predicate(refreshed)):
+                        return refreshed
+                messages = await self.messages(client, bot, limit=10)
+                for message in sorted(messages, key=lambda m: m.id):
+                    if message.id > after_id and not getattr(message, 'out', False) and predicate(message):
+                        return message
+                await asyncio.sleep(interval)
+        try:
+            return await asyncio.wait_for(poll(), timeout)
+        except TimeoutError:
+            return None
+===== END FILE: telegram_bot/clients/dialogue.py =====
+
+
+===== BEGIN FILE: telegram_bot/clients/request_tracker.py =====
+import asyncio
+from contextlib import asynccontextmanager
+
+
+class RequestTracker:
+    def __init__(self):
+        self.accepting = True
+        self.active = set()
+
+    @asynccontextmanager
+    async def track(self):
+        task = asyncio.current_task()
+        self.active.add(task)
+        try:
+            yield
+        finally:
+            self.active.discard(task)
+===== END FILE: telegram_bot/clients/request_tracker.py =====
+
+
+===== BEGIN FILE: telegram_bot/clients/session_store.py =====
+"""Persist only authorized keys; exclusive publication never replaces a Session."""
+import os
+import uuid
+from pathlib import Path
+from telethon.sessions import SQLiteSession
+
+
+def save_authorized_session(root: Path, key: str, session) -> Path:
+    if not key.isascii() or not key.isdigit():
+        raise ValueError('invalid_phone')
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    pending = root / '.pending'
+    pending.mkdir(mode=0o700, exist_ok=True)
+    if pending.is_symlink():
+        raise ValueError('unsafe_session_directory')
+    pending.chmod(0o700)
+    temporary = pending / (uuid.uuid4().hex + '.session')
+    final = root / (key + '.session')
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    os.close(fd)
+    try:
+        saved = SQLiteSession(str(temporary))
+        try:
+            saved.set_dc(session.dc_id, session.server_address, session.port)
+            saved.auth_key = session.auth_key
+            saved.save()
+        finally:
+            saved.close()
+        temporary.chmod(0o600)
+        # Same filesystem atomic no-clobber publication, unlike rename/replace.
+        os.link(temporary, final)
+        return final
+    finally:
+        for suffix in ('', '-journal', '-wal', '-shm'):
+            temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
+===== END FILE: telegram_bot/clients/session_store.py =====
+
+
+===== BEGIN FILE: telegram_bot/clients/userbot_manager.py =====
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError
+from telethon.sessions import MemorySession
+from .session_store import save_authorized_session
+from ..models.account import Account
+from ..models.enums import AccountState
+from ..utils.retry import retry_safe
+
+log = logging.getLogger(__name__)
+
+
+class AccountUnavailable(RuntimeError):
+    pass
+
+
+class UserbotManager:
+    def __init__(self, cfg, repository, factory=None):
+        self.cfg, self.repository = cfg, repository
+        self.factory = factory or (lambda path: TelegramClient(str(path) if not isinstance(path, MemorySession) else path, cfg.api_id, cfg.api_hash,
+                                    flood_sleep_threshold=0, request_retries=0, connection_retries=0,
+                                    auto_reconnect=False, retry_delay=cfg.retry_base,
+                                    raise_last_call_error=isinstance(path, MemorySession)))
+        self.accounts: dict[str, Account] = {}
+        self.semaphore = asyncio.Semaphore(cfg.concurrency)
+        self.stopping = False
+
+    def load(self):
+        if self.accounts:
+            return tuple(self.accounts.values())
+        if not self.cfg.sessions.is_dir():
+            log.warning('Session directory missing; no login will be requested')
+            return ()
+        for path in sorted(self.cfg.sessions.glob('*.session')):
+            if not path.stem.isdigit() or path.is_symlink():
+                log.warning('Skipping unsupported session filename')
+                continue
+            try:
+                self.accounts[path.stem] = Account(path.stem, path, self.factory(path))
+            except Exception as error:
+                log.error('Session load failed error_type=%s', type(error).__name__)
+                self.accounts[path.stem] = Account(path.stem, path, None, AccountState.ERROR,
+                                                   error_type=type(error).__name__)
+        return tuple(self.accounts.values())
+
+    async def start(self):
+        cooldowns = {r['phone']: r['until_at'] for r in await self.repository.cooldowns()}
+        self.load()
+        for a in self.accounts.values():
+            a.unavailable_until = cooldowns.get(a.key, 0)
+        await asyncio.gather(*(self.refresh(a, reconnect=True) for a in tuple(self.accounts.values())))
+
+    def exists(self, key):
+        return key in self.accounts or (self.cfg.sessions / (key + '.session')).exists()
+
+    def login_client(self):
+        return self.factory(MemorySession())
+
+    async def enroll(self, key, session):
+        if self.stopping or self.exists(key):
+            raise AccountUnavailable('existing_or_stopping')
+        path = save_authorized_session(self.cfg.sessions, key, session)
+        account = Account(key, path, self.factory(path))
+        self.accounts[key] = account
+        await self.refresh(account, reconnect=True)
+        if account.state != AccountState.ONLINE:
+            raise AccountUnavailable('saved_but_reconnect_failed')
+        return account
+
+    async def flood_wait(self, account, seconds):
+        account.unavailable_until = max(account.unavailable_until, time.time() + max(seconds, 1))
+        account.state = AccountState.UNAVAILABLE
+        await self.repository.set_cooldown(account.key, account.unavailable_until)
+
+    async def refresh(self, account, *, reconnect=False):
+        async with self.semaphore, account.lock:
+            if account.client is None:
+                account.state = AccountState.ERROR
+                return account.state
+            if account.unavailable_until > time.time():
+                account.state = AccountState.UNAVAILABLE
+                return account.state
+            try:
+                if not account.client.is_connected():
+                    account.state = AccountState.OFFLINE
+                    if not reconnect:
+                        return account.state
+                    await retry_safe(lambda: asyncio.wait_for(account.client.connect(), self.cfg.reply_timeout),
+                                     attempts=self.cfg.retry_attempts, base=self.cfg.retry_base)
+                authorized = await asyncio.wait_for(account.client.is_user_authorized(), self.cfg.reply_timeout)
+                account.state = AccountState.ONLINE if authorized else AccountState.UNAUTHORIZED
+                account.error_type = ''
+            except asyncio.CancelledError:
+                raise
+            except FloodWaitError as error:
+                await self.flood_wait(account, error.seconds)
+            except Exception as error:
+                account.state = AccountState.ERROR
+                account.error_type = type(error).__name__
+                log.warning('Account connection failed error_type=%s', account.error_type)
+            return account.state
+
+    @asynccontextmanager
+    async def operation(self, account):
+        async with self.semaphore, account.lock:
+            if self.stopping or account.unavailable_until > time.time() or account.state != AccountState.ONLINE:
+                raise AccountUnavailable('account_unavailable')
+            if not account.client.is_connected():
+                account.state = AccountState.OFFLINE
+                raise AccountUnavailable('account_disconnected')
+            try:
+                yield account.client
+            except FloodWaitError as error:
+                await self.flood_wait(account, error.seconds)
+                raise
+            except (ConnectionError, OSError):
+                account.state = AccountState.ERROR
+                raise
+
+    async def monitor(self):
+        while not self.stopping:
+            await asyncio.sleep(self.cfg.reconnect_interval)
+            await asyncio.gather(*(self.refresh(a, reconnect=True) for a in tuple(self.accounts.values())))
+
+    async def close(self):
+        self.stopping = True
+        async def disconnect(account):
+            if account.client is None:
+                return
+            try:
+                async with self.semaphore:
+                    await asyncio.wait_for(account.client.disconnect(), self.cfg.reply_timeout)
+            except Exception as error:
+                log.warning('Disconnect failed error_type=%s', type(error).__name__)
+            account.state = AccountState.OFFLINE
+        await asyncio.gather(*(disconnect(a) for a in tuple(self.accounts.values())))
+===== END FILE: telegram_bot/clients/userbot_manager.py =====
+
+
+===== BEGIN FILE: telegram_bot/config.py =====
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+class ConfigError(ValueError):
+    pass
+
+
+def read_private_env(path: Path) -> dict[str, str]:
+    values = {}
+    if not path.exists():
+        return values
+    for number, line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' not in line:
+            raise ConfigError(f'.env 第 {number} 行缺少等号')
+        key, value = line.split('=', 1)
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*', key.strip()):
+            raise ConfigError(f'.env 第 {number} 行键名无效')
+        values[key.strip()] = value.strip().strip('"\'')
+    return values
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str = field(repr=False)
+    admin_id: int
+    api_id: int
+    api_hash: str = field(repr=False)
+    database: Path
+    sessions: Path
+    log_file: Path
+    cache: Path
+    concurrency: int = 5
+    jr_balance_concurrency: int = 8
+    reply_timeout: float = 30
+    export_timeout: float = 45
+    retry_attempts: int = 3
+    retry_base: float = 2
+    reconnect_interval: float = 60
+    cache_ttl: int = 300
+    cleanup_interval: int = 60
+    ocr_timeout: float = 20
+    shutdown_timeout: float = 30
+    login_ttl: float = 300
+
+    @classmethod
+    def load(cls, root: Path | None = None, environ=None):
+        root = (root or Path(__file__).resolve().parents[1]).resolve()
+        env = read_private_env(root / '.env')
+        env.update(os.environ if environ is None else environ)
+
+        def required(name):
+            value = env.get(name, '').strip()
+            if not value:
+                raise ConfigError(f'缺少配置 {name}')
+            return value
+
+        def positive(name, default=None, cast=int):
+            raw = env.get(name, default)
+            try:
+                value = cast(raw)
+                if value <= 0 or (isinstance(value, float) and not __import__('math').isfinite(value)):
+                    raise ValueError
+                return value
+            except (ValueError, TypeError):
+                raise ConfigError(f'{name} 必须为有效正数') from None
+
+        token = required('BOT_TOKEN')
+        api_hash = required('API_HASH')
+        if not re.fullmatch(r'\d+:[A-Za-z0-9_-]{20,}', token):
+            raise ConfigError('BOT_TOKEN 格式错误')
+        if not re.fullmatch(r'[0-9a-fA-F]{32}', api_hash):
+            raise ConfigError('API_HASH 格式错误')
+
+        def path(name, default):
+            raw = env.get(name, default).strip()
+            if not raw:
+                raise ConfigError(f'{name} 路径为空')
+            candidate = Path(raw).expanduser()
+            return (root / candidate).resolve() if not candidate.is_absolute() else candidate.resolve()
+
+        cfg = cls(token, positive('ADMIN_ID'), positive('API_ID'), api_hash,
+                  path('DATABASE_PATH', 'data/bot.db'), path('SESSIONS_DIR', 'sessions'),
+                  path('LOG_PATH', 'logs/bot.log'), path('CACHE_DIR', '.jr_cache_files'),
+                  positive('MAX_CONCURRENCY', 5), positive('JR_BALANCE_CONCURRENCY', 8),
+                  positive('REPLY_TIMEOUT', 30, float), positive('EXPORT_TIMEOUT', 45, float),
+                  positive('RETRY_ATTEMPTS', 3), positive('RETRY_BASE', 2, float),
+                  positive('RECONNECT_INTERVAL', 60, float),
+                  ocr_timeout=positive('OCR_TIMEOUT', 20, float),
+                  shutdown_timeout=positive('SHUTDOWN_TIMEOUT', 30, float),
+                  login_ttl=positive('LOGIN_TTL', 300, float))
+        if cfg.admin_id != 683298845:
+            raise ConfigError('ADMIN_ID 必须为指定管理员 683298845')
+        for protected in (cfg.database, cfg.sessions, cfg.log_file):
+            if protected == cfg.cache or cfg.cache in protected.parents:
+                raise ConfigError('缓存目录不得包含数据库、Session 或日志')
+        if cfg.cache == root or cfg.cache in root.parents or cfg.cache == Path(cfg.cache.anchor):
+            raise ConfigError('缓存目录必须为专用子目录')
+        if cfg.sessions in cfg.cache.parents:
+            raise ConfigError('缓存目录不得位于 Session 目录内')
+        if cfg.database == cfg.log_file or cfg.sessions in cfg.database.parents or cfg.sessions in cfg.log_file.parents:
+            raise ConfigError('数据库、日志和 Session 路径必须分离')
+        return cfg
+===== END FILE: telegram_bot/config.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/__init__.py =====
+
+===== END FILE: telegram_bot/handlers/__init__.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/balance.py =====
+from .guards import protected
+from ..utils.message_format import reply_long
+
+
+def make_handler(ctx):
+    @protected(ctx)
+    async def handle(update, context):
+        await update.effective_message.reply_text('⏳ 查询账号积分中...')
+        results = await ctx.balances.all()
+        lines = ['📊 账号积分汇总']
+        for account, targets in results:
+            lines.append(account + '\n' + '\n'.join(
+                f'  {name}: ' + (f'积分: {r.value}' if r.value is not None else f'{r.outcome.value} ({r.reason})') for name, r in targets))
+        await reply_long(update.effective_message, '\n\n'.join(lines))
+    return handle
+===== END FILE: telegram_bot/handlers/balance.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/checkin.py =====
+from .guards import protected
+from ..utils.message_format import reply_long
+
+
+def make_handler(ctx):
+    @protected(ctx)
+    async def handle(update, context):
+        await update.effective_message.reply_text('⏳ 手动签到中；24 小时间隔仍然有效。')
+        results = await ctx.checkins.manual()
+        lines = ['📋 手动签到汇总']
+        for account, targets in results:
+            lines.append(account + '\n' + '\n'.join(f'  {name}: {r.outcome.value} ({r.reason})' for name, r in targets))
+        await reply_long(update.effective_message, '\n\n'.join(lines))
+    return handle
+===== END FILE: telegram_bot/handlers/checkin.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/guards.py =====
+from functools import wraps
+from telegram.ext import ApplicationHandlerStop
+
+
+def authorized(user_id, admin_id):
+    return user_id is not None and user_id == admin_id
+
+
+def protected(ctx):
+    def decorate(callback):
+        @wraps(callback)
+        async def wrapped(update, context):
+            if not update.effective_user or not update.effective_message:
+                return
+            if not authorized(update.effective_user.id, ctx.config.admin_id):
+                await update.effective_message.reply_text('⛔ 该功能仅限管理员使用。')
+                return
+            if not ctx.requests.accepting:
+                await update.effective_message.reply_text('程序正在关闭，请稍后再试。')
+                return
+            async with ctx.requests.track():
+                return await callback(update, context)
+        return wrapped
+    return decorate
+
+
+def banned_guard(ctx):
+    async def guard(update, context):
+        user = update.effective_user
+        if user and user.id != ctx.config.admin_id and await ctx.users.is_banned(user.id):
+            if update.effective_message:
+                await update.effective_message.reply_text('⛔ 你已被封禁，无法继续使用本机器人。')
+            raise ApplicationHandlerStop
+    return guard
+
+
+def admin_guard(ctx):
+    async def guard(update, context):
+        user = update.effective_user
+        if not user or not authorized(user.id, ctx.config.admin_id):
+            if update.effective_message:
+                await update.effective_message.reply_text('⛔ 仅管理员可以使用本机器人。')
+            raise ApplicationHandlerStop
+    return guard
+===== END FILE: telegram_bot/handlers/guards.py =====
