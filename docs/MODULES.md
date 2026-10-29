@@ -1,18 +1,15 @@
 # 模块维护与依赖说明
 
+本文档说明当前代码结构，后续重构可同步更新，不应将历史实现方式视为不可修改的要求。
+
 ## 目录树
 
 ```text
-telegram_bot_v2/
+cxbot/
 ├── docs/
-│   ├── AUDIT.md
-│   ├── CHANGES.md
 │   ├── DEPLOYMENT.md
-│   ├── GITHUB.md
 │   ├── LOGIN.md
-│   ├── MIGRATION_MAP.md
 │   ├── MODULES.md
-│   ├── TEST_REPORT.md
 │   ├── legacy_inventory.json
 │   ├── migration_map.json
 │   ├── release_audit.json
@@ -93,8 +90,6 @@ telegram_bot_v2/
 │   ├── logging_config.py
 │   └── target_bots.py
 ├── tests/
-│   ├── fixtures/
-│   │   └── README.md
 │   ├── integration/
 │   │   ├── test_boundaries.py
 │   │   ├── test_jr.py
@@ -103,11 +98,13 @@ telegram_bot_v2/
 │   │   ├── test_accounts_checkin_balance.py
 │   │   ├── test_architecture.py
 │   │   ├── test_config_format.py
+│   │   ├── test_first_chat_menu.py
 │   │   ├── test_login.py
 │   │   ├── test_pages_export_cache.py
 │   │   └── test_routes_ocr_lifecycle.py
 │   └── conftest.py
 ├── .env.example
+├── .gitattributes
 ├── .gitignore
 ├── README.md
 ├── main.py
@@ -181,11 +178,11 @@ handlers 的文件短是因为只承担传输层职责；没有 utils.py 或 ser
 
 - 目标机器人规则：target_bots.py；部署路径/并发/超时：config.py + .env.example。
 - 签到业务：checkin_service + CheckinRepository；相关测试 accounts_checkin_balance。
-- OCR：ocr_service；不加入 Telegram 安全验证自动操作；相关测试 routes_ocr_lifecycle。
+- OCR：ocr_service；当前第三方安全验证转人工处理，是否变更须检查实际服务与安全边界；相关测试 routes_ocr_lifecycle。
 - JR 行为：orchestrator 与对应单职责服务；状态枚举在 models/enums.py，账本 SQL 在 QueryRepository。
 - 数据库变化：migrations 增加新版本、严格校验与备份测试，禁止更改旧版本来覆盖已有生产库。
 - 命令：registration.COMMANDS 与 callbacks 一起维护，帮助/菜单使用同一清单，权限使用 protected。
-- 测试/版本/限制：TEST_REPORT.md；旧定义完整映射：MIGRATION_MAP.md + migration_map.json。
+- 测试命令见根目录 README；旧定义映射数据保留于 `docs/migration_map.json`，相关测试依赖它。
 
 ## 资源和恢复边界
 
@@ -193,7 +190,7 @@ handlers 的文件短是因为只承担传输层职责；没有 utils.py 或 ser
 
 重启可恢复签到 next_at、last_attempt/last_success、会员用量、封禁、缓存、冷却、查询阶段/消息 ID、额度预留、交付进度。不能从一次网络超时判断第三方是否收费，也不能证明 Bot API 发送是否已交付，需人工核实。OCR 原生线程不可强行杀死；等待超时后禁止追加识别任务，正常线程退出后可以继续，永久卡死需要运维重启进程。
 
-## 本次新增模块
+## 登录与菜单相关模块
 
 - handlers/login.py：私聊登录命令、输入删除和安全回复；依赖 LoginService。
 - services/login_service.py：手机号/验证码/两步验证状态机、期限、取消和限流；依赖 UserbotManager，不接触数据库或日志内容。

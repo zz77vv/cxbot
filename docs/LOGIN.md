@@ -21,7 +21,7 @@ LOGIN_TTL 默认 300 秒，期限从发起登录开始计算。每个管理员�
 重启加载忽略隐藏临时目录；Session 仍是标准 Telethon SQLite 格式。
 
 服务器应将 SESSIONS_DIR 设为 `/root/cxbot/sessions/`。源码仓库和发布允许清单不包含任何 Session 或私有 .env。
-本次使用模拟 Telegram 响应及真实临时 SQLite Session 测试，未向 Telegram 发送真实验证码、执行账号登录或启动生产机器人。
+截至 2026-10-28 的历史验证仅覆盖模拟 Telegram 响应和临时 SQLite Session；是否已完成真实 Telegram 登录或服务器验收，应以实际运行记录为准。
 接口依据：[Telethon 授权接口](https://docs.telethon.dev/en/stable/modules/client.html#telethon.client.auth.AuthMethods.sign_in) 与 [Session 说明](https://docs.telethon.dev/en/stable/concepts/sessions.html)。
 
 首次使用新机器人时先在管理员私聊发送 `/start` 建立聊天。菜单若因 Chat not found 无法注册，会延后到该私聊建立后补齐；不会阻止 polling 启动。

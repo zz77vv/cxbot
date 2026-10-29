@@ -1,73 +1,57 @@
-# Telegram 机器人模块化 V2
+# cxbot — Telegram 机器人 V2
 
-## 当前部署方式（2026-10-28）
+> 这是当前源码的使用与维护说明，不是不可修改的历史需求清单。后续功能调整应以明确的新需求和实际代码为起点，评估影响、权限与安全边界后修改代码、测试和文档。
 
-用户已确认采用全新数据库部署，不导入旧 bot.db。首次配置完成后程序会创建新库。
-服务器源码目录为 `/root/cxbot`，独立虚拟环境为 `/root/cxbot/.venv`。
-Ubuntu 24.04 / Python 3.12.3 上已通过 107 项离线测试、依赖检查和本地 OCR 模型调用。
-目前尚未接入真实 Telegram 配置或创建 Session，机器人没有启动。本次定向修改后的 123 项测试已在本地通过，新增登录尚未在真实 Telegram 或服务器执行验收。
+## 项目概览
 
-管理员可在私聊使用 `/login` → 手机号 → 验证码 → 可选两步验证密码完成登录，`/cancel` 退出。管理员固定为 `683298845`；新部署不需要导入旧数据库。Session 保存到配置的 SESSIONS_DIR，服务器应为 `/root/cxbot/sessions/`。
+Python 模块化 Telegram 机器人，使用 `python-telegram-bot`、`Telethon`、`aiosqlite`、`Pillow` 和 `ddddocr`。主要代码在 `telegram_bot/`，运行入口是 `main.py`。
 
-GitHub 使用独立源码镜像，目标为私有仓库 `zz77vv/cxbot` 的 `main`。不上传 `.env`、Session、数据库、缓存、日志、服务器登录信息或运行环境。首次发布状态与后续同步规则见 [GitHub 发布说明](docs/GITHUB.md)。
+- 管理三个目标机器人的签到和积分查询（目标规则见 `telegram_bot/target_bots.py`）。
+- 处理 JR 查询、账号选择、会员/每日额度、结果缓存、文件导出与分页交付。
+- 管理管理员私聊登录、Telethon Session、SQLite 任务状态及异常核实。
+- 提供 `scripts/` 运维脚本、`tests/` 单元/集成测试。
 
-基于用户提供的旧版单文件重构。保留三个目标多账号签到、余额查询、JR 原有入口与结果交付、独立 OCR、会员/每日用量和 SQLite 数据；移除自动广告系统。V2 位于独立目录，未覆盖旧文件、数据库或 Session，未部署服务器。
+## 快速开始
 
-Python 3.10–3.12，实际验证 Python 3.12.14 / Windows x64。依赖版本见 requirements.txt，完整实测环境见 requirements-lock.txt。Linux 服务器仍需独立安装和验收。
-
-## 安装与配置
+在项目根目录运行（推荐 Python 3.12）：
 
 ```bash
-cd telegram_bot_v2
 python3.12 -m venv .venv
 . .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-python scripts/check_environment.py --ocr-smoke
+python -m pip install -r requirements.txt
 cp .env.example .env
 chmod 600 .env
-```
-
-Windows 激活命令为 `.venv\Scripts\Activate.ps1`；本次工作区实际虚拟环境在项目的上一级 `.venv`。
-
-在服务器本地填写 `.env`：BOT_TOKEN、ADMIN_ID、API_ID、API_HASH。环境变量优先于 `.env`。不要将凭据发送到聊天中。源文件中发现硬编码凭据，建议管理员在本地评估必要的轮换；交付物没有复制其值。
-
-相对路径始终相对于项目根目录，不受启动工作目录影响。默认运行数据：
-
-```text
-data/bot.db                  SQLite 数据和 V2 任务账本
-data/bot.db.backup-*         每次打开已有库前的 SQLite 一致备份
-data/bot.db.instance.lock    操作系统进程互斥锁（不要运行中删除）
-sessions/数字.session       已授权的 Telethon SQLite Session
-logs/bot.log                 20 MB 轮转，保留 5 个历史文件
-.jr_cache_files/             结果文件和临时下载，禁止混放其他文件
-```
-
-可在 `.env` 设置 DATABASE_PATH、SESSIONS_DIR、LOG_PATH、CACHE_DIR、并发和超时等。三个目标指令、正则、按钮和业务上限集中在 telegram_bot/target_bots.py；签到间隔、偏移、分页和缓存寿命保持原值。
-
-旧数据先按 [升级和回滚步骤](docs/DEPLOYMENT.md) 制作副本并演练迁移。没有 Session 时 V2 仍可显示管理员状态，但不能执行账号业务；程序不会代为登录。未授权账号需部署者独立处理。
-
-## 运行和停止
-
-```bash
+python scripts/check_environment.py --ocr-smoke
 python main.py
 ```
 
-Linux 支持 SIGTERM/SIGINT；Windows 使用 Ctrl+C。关闭时停止接收任务，等待在途请求最多 SHUTDOWN_TIMEOUT 秒，取消剩余请求并记录待核实状态，再关闭后台任务、Bot API、OCR、用户客户端和数据库。不要同时运行旧版和 V2 访问同一批 Session。不要通过删除锁文件启动第二个进程。
+Windows 下虚拟环境激活命令为 `.venv\Scripts\activate`。配置文件 `.env` 应只在自己的运行环境中填写；所需配置项见 `.env.example`，包括 `BOT_TOKEN`、`ADMIN_ID`、`API_ID`、`API_HASH`。环境变量优先于 `.env`。
 
-管理员命令：`/start`、`/help`、`/jr 内容`、`/jr+内容`、`/qd`、`/jf`、`/status`、`/login`、`/cancel`。全部入口仅允许指定管理员，普通用户在业务执行前被拦截。Bot API 菜单不允许 `+` 字符，故菜单注册 jr，帮助中同时说明 jr+。
+首次部署默认新建 SQLite 数据库，数据库、Session、缓存与日志路径由 `telegram_bot/config.py` 和 `.env` 决定。示例运行数据包括 `data/bot.db`、`sessions/`、`logs/` 和 `.jr_cache_files/`。不要把实际 `.env`、Session、数据库、缓存、日志或密钥提交到 GitHub。
 
-## 关键行为
+## 管理员命令
 
-- 签到首次在未来 24 小时内随机；以后至少 24 小时，最多额外 15 分钟。手动签到同样检查间隔。失败不会写确认成功时间；历史 timestamp 仅作为兼容间隔基线。失败后的下一次写操作也至少间隔 24 小时，读取/连接采用有界退避。
-- JR 使用实时积分降序、相同积分保持原账号顺序；会员不加排序权重。非会员或未知身份每日 5 次，北京时间换日。明确无结果回复也记一次完成；未知任务暂时预留额度并阻止该账号再次查询。
-- 请求、购买和导出点击均不自动重试。Telegram FloodWait 持久化；任一账号仍处于 FloodWait 时暂停新的 JR 选号，不用其他账号绕开限制。
-- 查询意图在发送前提交 SQLite。超时不能证明未执行；未知状态保留任务 ID、账号、阶段和消息 ID，暂停同键请求和相关账号并通知管理员。重启只恢复核实状态，不重发。
-- 安全验证进入 manual 状态并通知管理员；不自动点击验证、不自动重发原请求。OCR 的原图片读取/预处理、beta 参数、置信度和离线 recognize_captcha 兼容接口保留，可独立调用测试。
-- 文件优先导出；明确不能导出或等待文件超时后，对现有结果作分页回退；最多 200 页，重复或未前进立即停止。未知购买结果不会回退为另一轮购买。
-- 缓存 TTL 300 秒，后台每 60 秒清理。未交付和待核实任务引用的文件可以超过 TTL 保留。丢失缓存文件进入人工处理，不自动重新购买。交付异常可能已经发送，必须先核实，不自动重复发送。
-- 查询原文不写日志或任务账本；账本保存规范化 SHA256、必要账号/消息 ID。实际结果仍可能含敏感信息，应限制数据库、缓存、备份和日志的服务器访问权限。
+| 命令 | 用途 |
+|---|---|
+| `/start`、`/help` | 菜单与帮助 |
+| `/jr 内容`、`/jr+内容` | JR 查询 |
+| `/qd` | 手动签到 |
+| `/jf` | 查询积分 |
+| `/status` | 查看运行状态 |
+| `/login`、`/cancel` | 私聊登录 / 取消登录 |
 
-## 测试
+当前命令在 `telegram_bot/handlers/registration.py` 注册；业务入口受管理员权限校验保护。
+
+## 当前实现与运行边界
+
+- 签到调度、积分解析、JR 账号选择、限额与缓存等具体参数以实际代码及配置为准。
+- 对可能已收费、已提交或已交付但结果不明确的任务，当前实现会记录状态并等待核实，不盲目重复执行。
+- 当前安全验证处理逻辑是转人工核实；OCR 模块可独立识别图片，但不代表已实现或允许绕过第三方访问控制。
+- 当前账户与结果数据存储使用 SQLite。不要用删除运行数据或锁文件的方式绕过状态检查。
+
+这些是**现有行为的描述**，不是禁止今后变更的永久规则。提出新功能时，应基于源码、实际服务能力及安全要求重新评估，而不是仅凭旧文档拒绝修改。
+
+## 测试与状态
 
 ```bash
 python -m compileall -q telegram_bot main.py scripts tests
@@ -76,16 +60,14 @@ python -m pip check
 python scripts/check_environment.py --ocr-smoke
 ```
 
-测试使用临时 SQLite、模拟 Session 和 Telegram 响应；外网连接被阻断，允许 Windows asyncio 所需本机回环。当前 Codex Windows 沙箱无法初始化 asyncio，所以本次完整异步测试在获准的沙箱外隔离环境执行。真实 Telegram、生产数据和 Linux 部署没有被验证；详见 [测试与交付报告](docs/TEST_REPORT.md)。
+截至 **2026-10-28** 的仓库记录：离线测试报告记载 123 项通过；该记录不能证明真实 Telegram 登录、生产服务器运行或长期稳定性已完成验收。必要时重新执行上述检查并核对部署环境。`docs/test-results.xml` 是既有测试运行记录，不代表当前重新测试。
 
-## 排错与维护
+## 文档与维护
 
-配置错误会以字段名报错且不回显值。账号 unauthorized：检查部署者提供的已授权 Session；error：看模块日志的异常类型；unavailable：等待持久化 FloodWait 结束。余额 format_changed 与零余额不同，需要依据实际合法响应修改对应目标正则并补充测试。
+- [模块结构与修改入口](docs/MODULES.md)
+- [部署、备份与回滚](docs/DEPLOYMENT.md)
+- [管理员私聊登录](docs/LOGIN.md)
 
-pending_review/manual/交付 unknown：先停止机器人，运行 `python scripts/review_tasks.py --database data/bot.db` 查看任务元信息，按 [人工核实流程](docs/DEPLOYMENT.md) 核实后处理。不要直接删除任务或清空缓存来绕过保护。
+GitHub 源码位于私有仓库 `zz77vv/cxbot` 的 `main` 分支。发布前检查变更、依赖和测试；同步时避免强制覆盖其他提交。`docs/` 中的 JSON/XML 是历史映射、审计或测试数据，其中 `legacy_inventory.json`、`migration_map.json` 仍被测试或工具使用，不要与过期 Markdown 一并删除。
 
-缓存目录外的旧绝对文件路径不会被下载、发送或删除，必须由部署者选择沿用原缓存根目录，或在副本上人工审计后重新映射路径。备份不自动清理，需设置服务器独立的容量监控和保留策略。
-
-模块定位见 [维护与依赖说明](docs/MODULES.md)、[逐函数迁移表](docs/MIGRATION_MAP.md) 和 [改动清单](docs/CHANGES.md)。原检查报告见 [阶段 A](docs/AUDIT.md)。
-
-登录安全和验证范围见 [在线登录说明](docs/LOGIN.md)。
+遇到问题时，先查 `telegram_bot/` 中的实际实现与异常日志（不记录敏感值）；需要人工核实或恢复的任务，使用 `scripts/review_tasks.py`、`scripts/deliver_saved.py`，操作细节见部署文档。

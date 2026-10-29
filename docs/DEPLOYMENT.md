@@ -1,8 +1,8 @@
 # 数据备份、迁移、部署和回滚
 
-本次只构建本地 V2，没有连接服务器、替换生产进程或打开生产数据。以下命令由部署者在服务器确认后执行。先做演练，再安排维护窗口；仅服务停止期间复制 Session。
+本文档是部署与恢复操作指南，不代表这些步骤已在生产服务器执行。新部署默认初始化全新数据库；仅需要继承旧数据时才执行下述可选迁移。操作前做好备份与演练；仅在相关进程停止后复制 Session。
 
-## 数据库演练
+## 旧数据库迁移演练（仅在需要时）
 
 1. 使用 Python 3.12 的独立虚拟环境安装依赖。先运行离线测试和环境检查。
 2. 制作一致性快照，目标必须是全新的文件：
@@ -17,13 +17,13 @@ snapshot 使用 SQLite backup，源连接为 mode=ro，不用直接复制正在�
 3. 核对五类旧业务表行数、抽样记录和缓存文件引用。检查 last_sign_time 单 phone 表是否展开三个目标；历史 timestamp 不会变成 V2 的“确认成功”时间。迁移不删除历史用量、会员、封禁或过期缓存记录；缓存清理由运行期独立执行。
 4. schema_migrations 当前为 1。新增 checkin_state、checkin_attempts、query_tasks、file_leases、account_cooldowns；旧缓存缺失 result_type/file_path/file_name 时仅增加字段。事务失败回滚。高于 1 的版本拒绝降级运行。
 
-## 切换
+## 新部署或旧版切换
 
-停止旧进程，确认退出；保存旧代码、私有配置、数据库一致快照、Session 完整副本以及缓存文件。不要将这些运行数据加入 Git 或交付压缩包。Windows/服务器文件权限由部署者设置。
+若已有旧版进程使用相同 Session，须先停止并确认退出；保留旧代码、私有配置、数据库一致快照、Session 完整副本和缓存文件。新部署若不迁移旧数据，无须复制旧数据库。不要将运行数据加入 Git 或交付压缩包。Windows/服务器文件权限由部署者设置。
 
-在 V2 独立目录配置 .env 指向数据库副本、Session 副本以及专用缓存目录。Session 格式保持原 Telethon SQLite 格式，不转换、不重登录、不批量迁移；只接收数字文件名。首次验证使用副本，且同一 Session 不得与旧版并行运行。
+在部署目录配置 `.env`：新部署使用独立的新数据库和专用 Session/缓存目录；如迁移历史数据，应使用演练确认的数据库副本。从旧版复制 Session 时保持原 Telethon SQLite 格式，只接收数字文件名；同一 Session 不得与旧版并行运行。
 
-旧缓存保存绝对路径；有两种经审核的部署方式：沿用该专用缓存目录并配置 CACHE_DIR；或复制到新的专用根目录并在数据库副本中逐条核验/重新映射。V2 不猜测旧路径、不删除根目录外文件。不要在未迁移文件引用时启动缓存清理。
+仅在迁移旧数据时，需注意旧缓存可能保存绝对路径；有两种经审核的部署方式：沿用该专用缓存目录并配置 CACHE_DIR；或复制到新的专用根目录并在数据库副本中逐条核验/重新映射。V2 不猜测旧路径、不删除根目录外文件。不要在未迁移文件引用时启动缓存清理。
 
 ```bash
 python scripts/check_environment.py --ocr-smoke
@@ -43,8 +43,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=telegrambot
-WorkingDirectory=/srv/telegram_bot_v2
-ExecStart=/srv/telegram_bot_v2/.venv/bin/python /srv/telegram_bot_v2/main.py
+WorkingDirectory=/srv/cxbot
+ExecStart=/srv/cxbot/.venv/bin/python /srv/cxbot/main.py
 Restart=on-failure
 RestartSec=15
 KillSignal=SIGTERM
@@ -55,7 +55,7 @@ UMask=0077
 WantedBy=multi-user.target
 ```
 
-systemd 模板未在当前 Windows 环境执行验证。正式部署安装运行依赖即可；测试依赖单独用于演练。不要将服务环境或 Token 写入 systemd 公共日志。日志 20 MB × (当前 + 5 历史)，备份和未核实结果没有自动过期删除，需监控磁盘。
+systemd 模板示例采用 `/srv/cxbot` 和独立服务用户，使用前必须按实际目录与文件权限修改；它并不证明已完成服务器验收。正式部署安装运行依赖即可；测试依赖单独用于演练。不要将服务环境或 Token 写入 systemd 公共日志。日志 20 MB × (当前 + 5 历史)，备份和未核实结果没有自动过期删除，需监控磁盘。
 
 ## 人工核实与结果交付
 
@@ -90,4 +90,4 @@ deliver_saved 使用同目录 .env，只发已保存结果给配置的管理员�
 
 恢复此前保留的旧代码和私有配置，使用切换前一致快照及对应 Session/缓存副本。离线恢复时用全新目录；不要覆盖唯一备份，也不要把旧 .db 与 V2 的 -wal/-shm 文件混用。不要将 V2 库直接交给旧代码运行。
 
-V2 新版本升级同样先停止、快照、在副本上迁移和测试，再切换。回滚后旧版仍有本报告指出的重复付费和签到误判问题，不能把回滚当作问题已经修复。
+V2 新版本升级同样先停止、快照、在副本上迁移和测试，再切换。回滚后旧版可能重新出现之前已识别的重复执行与状态误判风险；回滚不等于问题已经修复。
