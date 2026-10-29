@@ -1082,3 +1082,336 @@ def admin_guard(ctx):
             raise ApplicationHandlerStop
     return guard
 ===== END FILE: telegram_bot/handlers/guards.py =====
+
+===== BEGIN FILE: telegram_bot/handlers/jr_query.py =====
+import re
+from .guards import protected
+
+JR_ROUTE = re.compile(r'^/jr(?:@\w+)?(?:\+|\s|$)', re.I)
+
+
+def parse_request(text, bot_username=None):
+    match = re.match(r'^/jr(?:@(?P<bot>\w+))?(?:(?:\+|\s+)(?P<body>.*))?$', (text or '').strip(), re.I | re.S)
+    if not match:
+        return None
+    if match['bot'] and bot_username and match['bot'].casefold() != bot_username.casefold():
+        return None
+    return (match['body'] or '').strip()
+
+
+def make_handler(ctx):
+    @protected(ctx)
+    async def handle(update, context):
+        text = parse_request(update.effective_message.text, context.bot.username)
+        if text is None:
+            return
+        if not text:
+            await update.effective_message.reply_text('用法：/jr 查询内容\n或 /jr+查询内容')
+            return
+        status = await update.effective_message.reply_text('⏳ 正在检查缓存、任务状态和可用账号...')
+        # update_id is durable across retries; identical updates cannot submit twice.
+        report = await ctx.jr.execute(f'{update.effective_chat.id}:{update.update_id}', text)
+        await status.edit_text(f'任务：{report.task_id or "未创建"}\n状态：{report.state.value}\n说明：{report.reason}')
+    return handle
+===== END FILE: telegram_bot/handlers/jr_query.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/login.py =====
+import logging
+from .guards import protected
+
+
+def login_route(ctx, action):
+    @protected(ctx)
+    async def handle(update, context):
+        chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+        private = chat.type == 'private'
+        if not private:
+            await message.reply_text('登录只能在管理员私聊中进行。')
+            return
+        if action == 'submit':
+            # Do not accept edited/replayed credentials or log the Update object.
+            if not update.message:
+                return
+            if user.id not in ctx.logins.attempts:
+                return
+            try:
+                await message.delete()
+            except Exception:
+                logging.getLogger(__name__).warning('Login message deletion failed; no content logged')
+            reply = await ctx.logins.submit(user.id, chat.id, private, message.text, update.update_id)
+        else:
+            reply = await getattr(ctx.logins, action)(user.id, chat.id, private)
+        if reply:
+            await context.bot.send_message(chat_id=chat.id, text=reply)
+    return handle
+
+
+def start_handler(ctx):
+    return login_route(ctx, 'begin')
+
+
+def cancel_handler(ctx):
+    return login_route(ctx, 'cancel')
+
+
+def input_handler(ctx):
+    return login_route(ctx, 'submit')
+===== END FILE: telegram_bot/handlers/login.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/menu_sync.py =====
+import logging
+from telegram import BotCommand, BotCommandScopeChat
+from telegram.error import BadRequest, NetworkError
+from ..utils.retry import retry_safe
+
+
+def missing_private_chat(error):
+    return isinstance(error, BadRequest) and 'chat not found' in str(error).lower()
+
+
+async def set_admin_menu(bot, cfg, specs):
+    try:
+        await retry_safe(lambda: bot.set_my_commands(
+            [BotCommand(name, desc) for name, desc in specs.items()],
+            scope=BotCommandScopeChat(cfg.admin_id)),
+            attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+        return True
+    except BadRequest as error:
+        if not missing_private_chat(error):
+            raise
+        logging.getLogger(__name__).info('Admin menu deferred until first private interaction')
+        return False
+===== END FILE: telegram_bot/handlers/menu_sync.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/registration.py =====
+import logging
+from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
+                       BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
+                       BotCommandScopeAllChatAdministrators)
+from telegram.ext import CommandHandler, MessageHandler, filters
+from telegram.error import NetworkError, BadRequest
+from .menu_sync import missing_private_chat, set_admin_menu
+from . import start_help, checkin, balance, jr_query, status, login
+from .guards import admin_guard
+from ..utils.retry import retry_safe
+
+COMMANDS = {
+    'start': '显示当前身份对应的功能菜单',
+    'help': '显示当前身份对应的帮助',
+    'jr': '查询内容 - 巨人查询（也支持 /jr+内容）',
+    'qd': '手动触发所有账号签到',
+    'jf': '查询所有账号签到积分',
+    'status': '查看运行状态',
+    'login': '私聊登录协议号',
+    'cancel': '取消私聊登录',
+}
+
+
+def register(application, ctx):
+    menu = start_help.make_handler(ctx, COMMANDS)
+    state = status.make_handler(ctx)
+    callbacks = {'start': menu, 'help': menu, 'jr': jr_query.make_handler(ctx),
+                 'qd': checkin.make_handler(ctx), 'jf': balance.make_handler(ctx),
+                 'status': state, 'login': login.start_handler(ctx), 'cancel': login.cancel_handler(ctx)}
+    application.add_handler(MessageHandler(filters.ALL, admin_guard(ctx)), group=-1)
+    for command, callback in callbacks.items():
+        if command == 'jr':
+            application.add_handler(MessageHandler(filters.TEXT & filters.Regex(jr_query.JR_ROUTE), callback))
+        else:
+            application.add_handler(CommandHandler(command, callback))
+
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, login.input_handler(ctx)))
+
+    async def on_error(update, context):
+        logging.getLogger(__name__).error('Update handling failed error_type=%s', type(context.error).__name__)
+    application.add_error_handler(on_error)
+    return callbacks
+
+
+async def configure_menus(bot, cfg):
+    scopes = (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats(),
+              BotCommandScopeAllChatAdministrators(), BotCommandScopeChat(cfg.admin_id))
+    for scope in scopes:
+        for language in ('', 'zh', 'en'):
+            try:
+                await retry_safe(lambda: bot.delete_my_commands(scope=scope, language_code=language),
+                                 attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+            except BadRequest as error:
+                if not isinstance(scope, BotCommandScopeChat) or not missing_private_chat(error):
+                    raise
+    await retry_safe(lambda: bot.set_my_commands([], scope=BotCommandScopeDefault()),
+                     attempts=cfg.retry_attempts, base=cfg.retry_base, retry_on=(NetworkError,))
+    await set_admin_menu(bot, cfg, COMMANDS)
+===== END FILE: telegram_bot/handlers/registration.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/start_help.py =====
+from .guards import protected
+from .menu_sync import set_admin_menu
+
+
+def make_handler(ctx, specs):
+    @protected(ctx)
+    async def handle(update, context):
+        if update.effective_chat.type == 'private':
+            await set_admin_menu(context.bot, ctx.config, specs)
+        text = '🛠 管理员控制台\n\n' + '\n'.join(f'/{name} - {description}' for name, description in specs.items())
+        await update.effective_message.reply_text(text + '\n/jr+查询内容 - 巨人查询快捷入口')
+    return handle
+===== END FILE: telegram_bot/handlers/start_help.py =====
+
+
+===== BEGIN FILE: telegram_bot/handlers/status.py =====
+from .guards import protected
+from ..utils.message_format import reply_long
+
+
+def make_handler(ctx):
+    @protected(ctx)
+    async def handle(update, context):
+        rows = await ctx.status.snapshot()
+        lines = ['📡 协议号状态']
+        for key, state, error, until in rows:
+            lines.append(f'{key}: {state}' + (f' ({error})' if error else ''))
+        lines.append(f'总账号：{len(rows)}；在线：{sum(r[1] == "online" for r in rows)}')
+        lines.append(f'JR 活跃请求：{len(ctx.jr.active)}；接收新请求：{ctx.jr.accepting}')
+        await reply_long(update.effective_message, '\n'.join(lines))
+    return handle
+===== END FILE: telegram_bot/handlers/status.py =====
+
+
+===== BEGIN FILE: telegram_bot/lifecycle.py =====
+import asyncio
+import logging
+
+log = logging.getLogger(__name__)
+
+
+class TaskRegistry:
+    def __init__(self, stop_event=None):
+        self.tasks = set()
+        self.stop_event = stop_event
+        self.failure = None
+
+    def start(self, coroutine, name):
+        task = asyncio.create_task(coroutine, name=name)
+        self.tasks.add(task)
+        task.add_done_callback(self._done)
+        return task
+
+    def _done(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            self.failure = type(task.exception()).__name__
+            log.error('Background task failed name=%s error_type=%s', task.get_name(), type(task.exception()).__name__)
+            if self.stop_event:
+                self.stop_event.set()
+
+    async def close(self):
+        tasks = tuple(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.tasks.clear()
+
+
+class Lifecycle:
+    def __init__(self, ctx, bot, queries):
+        self.ctx, self.bot, self.queries = ctx, bot, queries
+        self.stop_event = asyncio.Event()
+        self.registry = TaskRegistry(self.stop_event)
+        self.closed = False
+
+    async def run(self):
+        try:
+            recovered = await self.queries.recover()
+            await self.ctx.cache.repository.clear_stale_leases()
+            await self.ctx.accounts.start()
+            await self.bot.start()
+            for row in recovered:
+                await self.ctx.jr.exports.notify(row['task_id'], row['state'], 'restart_requires_review')
+            await self.ctx.cache.cleanup()
+            self.ctx.checkins.start(self.registry)
+            self.registry.start(self.ctx.logins.loop(), 'login-expiry')
+            self.registry.start(self.ctx.accounts.monitor(), 'account-monitor')
+            self.registry.start(self.ctx.cache.loop(), 'cache-cleanup')
+            log.info('V2 started accounts=%d', len(self.ctx.accounts.accounts))
+            await self.stop_event.wait()
+            if self.registry.failure:
+                raise RuntimeError('critical_background_task_failed')
+        finally:
+            await self.close()
+
+    async def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.ctx.jr.accepting = False
+        self.ctx.requests.accepting = False
+        try:
+            await self.bot.stop_polling()
+        except Exception as error:
+            log.warning('Stop polling error_type=%s', type(error).__name__)
+        active = tuple(self.ctx.jr.active | self.ctx.requests.active)
+        if active:
+            _, pending = await asyncio.wait(active, timeout=self.ctx.config.shutdown_timeout)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*active, return_exceptions=True)
+        await self.registry.close()
+        for name, close in [('logins', self.ctx.logins.close), ('bot', self.bot.close), ('ocr', self.ctx.ocr.close),
+                             ('accounts', self.ctx.accounts.close), ('database', self.ctx.database.close)]:
+            try:
+                await close()
+            except Exception as error:
+                log.error('Resource close failed resource=%s error_type=%s', name, type(error).__name__)
+===== END FILE: telegram_bot/lifecycle.py =====
+
+
+===== BEGIN FILE: telegram_bot/logging_config.py =====
+import logging
+import re
+from logging.handlers import RotatingFileHandler
+
+
+class RedactFilter(logging.Filter):
+    def __init__(self, secrets=()):
+        super().__init__()
+        self.secrets = tuple(s for s in secrets if s)
+
+    def filter(self, record):
+        message = record.getMessage()
+        for secret in self.secrets:
+            message = message.replace(secret, '[REDACTED]')
+        message = re.sub(r'\b\d{5,}:[A-Za-z0-9_-]{20,}', '[REDACTED]', message)
+        record.msg, record.args = message, ()
+        # Exception strings may contain HTTP URLs or user query payloads.
+        if record.exc_info:
+            record.msg += f' error_type={record.exc_info[0].__name__}'
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+def configure_logging(cfg):
+    cfg.log_file.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(cfg.log_file, maxBytes=20 * 1024 * 1024,
+                                  backupCount=5, encoding='utf-8')
+    handler.addFilter(RedactFilter((cfg.bot_token, cfg.api_hash)))
+    handler.setFormatter(logging.Formatter('%(asctime)s %(name)s %(levelname)s %(message)s'))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    for name in ('httpx', 'httpcore', 'telethon'):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    return handler
+===== END FILE: telegram_bot/logging_config.py =====
+
+
+===== BEGIN FILE: telegram_bot/models/__init__.py =====
+
+===== END FILE: telegram_bot/models/__init__.py =====
