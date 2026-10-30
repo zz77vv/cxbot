@@ -1,6 +1,12 @@
 import re
+import asyncio
+import logging
+from collections import OrderedDict
 from .guards import protected
-from ..utils.user_messages import state_text, reason_text
+from ..services.jr.progress import JRProgress
+from ..models.enums import QueryState
+
+log = logging.getLogger(__name__)
 
 JR_ROUTE = re.compile(r'^/jr(?:@\w+)?(?:\+|\s|$)', re.I)
 
@@ -15,6 +21,8 @@ def parse_request(text, bot_username=None):
 
 
 def make_handler(ctx):
+    seen = OrderedDict()
+
     @protected(ctx)
     async def handle(update, context):
         text = parse_request(update.effective_message.text, context.bot.username)
@@ -23,8 +31,30 @@ def make_handler(ctx):
         if not text:
             await update.effective_message.reply_text('用法：/jr 查询内容\n或 /jr+查询内容')
             return
-        status = await update.effective_message.reply_text('⏳ 正在检查缓存、任务状态和可用账号...')
-        # update_id is durable across retries; identical updates cannot submit twice.
-        report = await ctx.jr.execute(f'{update.effective_chat.id}:{update.update_id}', text)
-        await status.edit_text(f'任务：{report.task_id or "未创建"}\n状态：{state_text(report.state)}\n说明：{reason_text(report.reason)}')
+        request_id = f'{update.effective_chat.id}:{update.update_id}'
+        if request_id in seen:
+            return
+        # Mark before the first await so concurrent copies of one update share no sends.
+        seen[request_id] = False
+        progress = None
+        try:
+            status = await update.effective_message.reply_text(JRProgress.initial_text())
+            progress = JRProgress(status, ctx.config.reply_timeout)
+            # update_id is durable across retries; identical updates cannot submit twice.
+            report = await ctx.jr.execute(request_id, text, progress=progress)
+            await progress.finish(report)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.error('event=jr_progress_failed error_type=%s', type(error).__name__)
+            if progress is not None:
+                await progress.fail(progress.task_id, QueryState.PENDING_REVIEW, f'uncertain_{type(error).__name__}')
+        finally:
+            seen[request_id] = True
+            # Never evict an active update: it could still be delivering a result.
+            for key, completed in list(seen.items()):
+                if len(seen) <= 512:
+                    break
+                if completed:
+                    seen.pop(key)
     return handle

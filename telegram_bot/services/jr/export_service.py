@@ -40,10 +40,10 @@ class ExportService:
         self.cfg, self.dialogue, self.queries, self.cache = cfg, dialogue, queries, cache
         self.bot = bot
 
-    async def from_pages(self, task, pages, *, status='unknown', reason='local_page_collection'):
+    async def from_pages(self, task, pages, *, status='unknown', reason='local_page_collection', force_file=False):
         if not pages.text:
             raise ValueError('empty_result')
-        if not pages.paginated:
+        if not pages.paginated and not force_file:
             return JRQueryResult('text', pages.text, export_status=status, fallback_reason=reason)
         # Called only after PaginationService has confirmed the complete sequence.
         async with self.cache.lock:
@@ -102,7 +102,7 @@ class ExportService:
                 return None, 'member', 'export_download_failed'
         return None, 'member' if success_seen else 'unknown', 'export_file_timeout'
 
-    async def deliver(self, task, result):
+    async def deliver(self, task, result, *, progress=None):
         """Record intent before every send; ambiguous delivery never auto-retries."""
         row = await self.queries.get(task)
         if row['delivery_state'] != 'not_started':
@@ -114,21 +114,30 @@ class ExportService:
                     path = confined(self.cfg.cache, result.file_path or '')
                     with path.open('rb') as stream:
                         await self.bot.send_document(chat_id=self.cfg.admin_id, document=stream, filename=result.file_name)
+                    if progress is not None:
+                        progress.file_sent = True
                     await self.queries.delivery(task, 'delivered', 1)
                 else:
                     cleaned = normalize_jr_full_result(result.text)
                     if not cleaned:
                         raise ValueError('empty_result')
-                    pieces = split_text_by_lines(cleaned, limit=3600)
-                    for index, piece in enumerate(pieces):
-                        title = '✅ 巨人查询完成' if index == 0 else f'—— 续 {index + 1}/{len(pieces)} ——'
-                        await self.bot.send_message(chat_id=self.cfg.admin_id, text=f'{title}\n\n{piece}')
-                        await self.queries.delivery(task, 'sending', index + 1)
-                    await self.queries.delivery(task, 'delivered', len(pieces))
-                return 'delivered'
+                    if progress is not None:
+                        await progress.deliver_text(cleaned)
+                        await self.queries.delivery(task, 'delivered', 1)
+                    else:
+                        pieces = split_text_by_lines(cleaned, limit=3600)
+                        for index, piece in enumerate(pieces):
+                            title = '✅ 巨人查询完成' if index == 0 else f'—— 续 {index + 1}/{len(pieces)} ——'
+                            await self.bot.send_message(chat_id=self.cfg.admin_id, text=f'{title}\n\n{piece}')
+                            await self.queries.delivery(task, 'sending', index + 1)
+                        await self.queries.delivery(task, 'delivered', len(pieces))
             except BaseException:
                 await self.queries.delivery(task, 'unknown')
                 raise
+        # Cleanup is outside the delivery transaction: failure must never resend a file.
+        if progress is not None and result.kind == 'file':
+            await progress.delete_after_file()
+        return 'delivered'
 
     async def notify(self, task, state, reason):
         try:

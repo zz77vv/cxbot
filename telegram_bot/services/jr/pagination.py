@@ -1,9 +1,12 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from .result_parser import (parse_page_info, clean_page_text, page_content_signature,
                             find_next_page_button, is_verification_message, classify,
                             parse_result_header, normalize_jr_full_result)
 from ...target_bots import JR_MAX_PAGES, JR_PAGE_INTERVAL
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,7 +24,7 @@ class PaginationService:
     async def collect(self, client, first_message, max_pages=JR_MAX_PAGES):
         return (await self.collect_result(client, first_message, max_pages)).text
 
-    async def collect_result(self, client, first_message, max_pages=JR_MAX_PAGES):
+    async def collect_result(self, client, first_message, max_pages=JR_MAX_PAGES, *, on_page=None):
         if not 1 <= max_pages <= JR_MAX_PAGES:
             raise ValueError('分页上限不得扩大')
         pages, seen, visited = {}, set(), set()
@@ -64,6 +67,11 @@ class PaginationService:
                     raise ValueError('page_marker_disappeared')
                 number, total = index + 1, None
             pages[number] = clean_page_text(current)
+            if on_page is not None:
+                try:
+                    await on_page(number, total)
+                except Exception as error:
+                    log.warning('event=page_progress_failed error_type=%s', type(error).__name__)
             if info and number == total:
                 return completed()
             button = find_next_page_button(current)
