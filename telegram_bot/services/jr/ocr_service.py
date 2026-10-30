@@ -1,6 +1,7 @@
 """Offline OCR compatibility. No Telegram clicks or automatic verification submission."""
 import asyncio
 import logging
+import math
 import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
@@ -62,7 +63,7 @@ def _classification_with_confidence(image_bytes: bytes, ocr_engine):
     if isinstance(result, str):
         return result, None
 
-    # ddddocr 1.6+ 直接返回已解码文本和总置信度。
+    # Some adapters return decoded text and a score directly.
     if "text" in result:
         confidence = result.get("confidence")
         return (
@@ -75,16 +76,27 @@ def _classification_with_confidence(image_bytes: bytes, ocr_engine):
     probabilities = result.get("probability") or []
     recognized = []
     scores = []
+    previous = None
     for row in probabilities:
-        if not row:
-            continue
+        # Restricted ddddocr output uses -1 for characters absent from its
+        # vocabulary. Do not renormalize candidate probabilities: doing so
+        # would turn a weak prediction into an apparently confident one.
+        if (len(row) != len(charsets) or not row
+                or any(not math.isfinite(value) or (value != -1 and not 0 <= value <= 1)
+                       for value in row)):
+            raise OCRRecognitionError('InvalidProbabilities')
         index = max(range(len(row)), key=row.__getitem__)
-        if index >= len(charsets):
-            continue
         char = charsets[index]
+        if row[index] < 0:
+            raise OCRRecognitionError('InvalidProbabilities')
         if char:
-            recognized.append(char)
+            # CTC repeats adjacent frames for a single character. A blank
+            # resets the run, so two identical letters separated by a blank
+            # remain two letters. Keep every nonblank score in the mean.
+            if index != previous:
+                recognized.append(char)
             scores.append(float(row[index]))
+        previous = index if char else None
 
     confidence = sum(scores) / len(scores) if scores else 0.0
     return "".join(recognized), confidence
@@ -143,34 +155,36 @@ def _recognize_captcha_sync(
 
     ocr_engine.set_ranges("123456789")
     index_text = ocr_engine.classification(_pil_to_png_bytes(red_mask))
-    index_digits = re.findall(r"[1-9]", str(index_text))
-    valid_indexes = [
-        int(value) for value in index_digits
-        if 1 <= int(value) <= candidate_count
-    ]
-    if len(set(valid_indexes)) != 1:
+    index_text = unicodedata.normalize('NFKC', str(index_text)).strip()
+    if not re.fullmatch(r'[1-9]', index_text) or int(index_text) > candidate_count:
         raise OCRRecognitionError('InstructionIndexAmbiguous')
-    target_index = valid_indexes[0]
+    target_index = int(index_text)
 
-    # 下半部分按候选数量等分。每格左侧约 35% 是“1.”这样的编号，
-    # 右侧才是目标字；裁掉编号后只识别图片顺序中的第 N 个汉字。
+    # Preserve more of the glyph than the old 35%-95% crop. Stay within
+    # the selected slot: never include a neighbouring answer. This remains
+    # specific to the supported equal-width JR layout, not a text detector.
     slot_width = width / candidate_count
     slot_left = (target_index - 1) * slot_width
     word_crop = image.crop((
-        int(slot_left + slot_width * 0.35),
+        int(slot_left + slot_width * 0.20),
         int(height * 0.45),
-        int(slot_left + slot_width * 0.95),
+        int(slot_left + slot_width),
         int(height * 0.96),
     ))
-    word_crop = ImageOps.grayscale(word_crop)
-    word_crop = ImageOps.autocontrast(word_crop)
-    word_crop = word_crop.point(lambda value: 0 if value < 125 else 255)
-
     ocr_engine.set_ranges(candidate_charset)
-    recognized, confidence = _classification_with_confidence(
-        _pil_to_png_bytes(word_crop), ocr_engine
-    )
-    return target_index, recognized, confidence
+    # Exactly two views, on the existing single worker. Preserve antialiased
+    # strokes instead of destroying them with a fixed binary threshold.
+    # Agreement is required; never select whichever view has the best score.
+    views = (word_crop, ImageOps.autocontrast(ImageOps.grayscale(word_crop)))
+    readings = [_classification_with_confidence(_pil_to_png_bytes(view), ocr_engine)
+                for view in views]
+    texts = [normalize_ocr_text(text) for text, _ in readings]
+    if not texts[0] or texts[0] != texts[1]:
+        raise OCRRecognitionError('RecognitionDisagreement')
+    scores = [score for _, score in readings]
+    if any(score is None or not math.isfinite(score) or not 0 <= score <= 1 for score in scores):
+        raise OCRRecognitionError('InvalidConfidence')
+    return target_index, readings[0][0], min(scores)
 
 
 @dataclass(frozen=True)
@@ -222,6 +236,8 @@ class OCRService:
                 index, text, confidence = await asyncio.wait_for(asyncio.shield(self.pending), self.timeout)
                 if not normalize_ocr_text(text):
                     return OCRResult(Outcome.FAILED, error_type='EmptyRecognition')
+                if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
+                    return OCRResult(Outcome.FAILED, error_type='InvalidConfidence')
                 if confidence is not None and confidence < OCR_MIN_CONFIDENCE:
                     return OCRResult(Outcome.FAILED, text, confidence, index, 'LowConfidence')
                 return OCRResult(Outcome.SUCCESS, text, confidence, index)
