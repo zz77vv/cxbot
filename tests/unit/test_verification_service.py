@@ -5,7 +5,8 @@ from unittest.mock import AsyncMock, create_autospec
 import pytest
 from conftest import button, message
 from telegram_bot.clients.dialogue import signature
-from telegram_bot.services.jr.ocr_service import OCRService
+from telegram_bot.services.jr.ocr_service import OCRService, OCRRecognitionError, OCRResult
+from telegram_bot.models.enums import Outcome
 from telegram_bot.services.jr.verification_service import VerificationError, VerificationService
 from telegram_bot.target_bots import JR, OCR_MAX_ATTEMPTS, OCR_MIN_CONFIDENCE
 
@@ -90,10 +91,49 @@ async def test_errors_are_not_retried_or_leaked(verification, client, step):
                  'click': current.click, 'wait': verification.dialogue.wait,
                  'submit': verification.target.submit, 'ready': verification.target.ready}[step]
     operation.side_effect = TimeoutError('private fixture data')
-    with pytest.raises(VerificationError, match='^TimeoutError$'):
+    stage = {'download': 'image_download', 'ocr': 'ocr', 'click': 'button_click',
+             'wait': 'wait_after_click', 'submit': 'resubmit', 'ready': 'wait_result'}[step]
+    with pytest.raises(VerificationError, match=f'^{stage}:TimeoutError$'):
         await verification.solve(client, current, 'fixture')
     operation.assert_awaited_once()
     assert verification.target.submit.await_count <= 1
+
+
+@pytest.mark.parametrize('code', ['LowConfidence', 'EmptyRecognition', 'OCRBusyOrClosed',
+                                 'InstructionIndexAmbiguous', 'InvalidImageSize', 'TimeoutError'])
+async def test_ocr_failure_code_survives_adapter_and_verification(verification, client, code, caplog):
+    service = OCRService()
+    service.recognize = AsyncMock(return_value=OCRResult(Outcome.FAILED, 'private OCR text', 0.1, error_type=code))
+    verification.ocr = service
+    current = prompt()
+    try:
+        with pytest.raises(VerificationError, match=f'^ocr:{code}$'):
+            await verification.solve(client, current, 'private query')
+        assert 'stage=ocr' in caplog.text and f'code={code}' in caplog.text
+        assert 'confidence=0.1' in caplog.text and 'candidates=1' in caplog.text
+        assert 'private OCR text' not in caplog.text and 'private query' not in caplog.text
+        current.click.assert_not_awaited()
+        verification.target.submit.assert_not_awaited()
+    finally:
+        await service.close()
+
+
+async def test_ambiguous_instruction_has_safe_code_without_raw_ocr(caplog):
+    from io import BytesIO
+    from PIL import Image
+    from unittest.mock import Mock
+    output = BytesIO()
+    Image.new('RGB', (200, 100), 'white').save(output, format='PNG')
+    engine = Mock()
+    engine.classification.return_value = 'private unrecognized instruction'
+    service = OCRService(engine_factory=lambda: engine)
+    try:
+        with pytest.raises(OCRRecognitionError, match='^InstructionIndexAmbiguous$'):
+            await service.recognize_captcha(output.getvalue(), '字', 1)
+        assert 'InstructionIndexAmbiguous' in caplog.text
+        assert 'private unrecognized instruction' not in caplog.text
+    finally:
+        await service.close()
 
 
 async def test_cancellation_propagates(verification, client):

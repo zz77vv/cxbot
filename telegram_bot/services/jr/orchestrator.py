@@ -73,6 +73,7 @@ class Orchestrator:
                     try:
                         reply, query_after_id = await self.verification.solve(client, reply, text)
                     except VerificationError as error:
+                        log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
                         return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}')
                     await self.repository.transition(task, QueryState.SUBMITTED,
                                                      sent_id=query_after_id, source_id=reply.id)

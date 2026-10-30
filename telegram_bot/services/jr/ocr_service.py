@@ -16,6 +16,14 @@ from ...models.enums import Outcome
 
 log = logging.getLogger(__name__)
 
+
+class OCRRecognitionError(RuntimeError):
+    """Safe OCR diagnostic fields; never carries recognized text or images."""
+    def __init__(self, code: str, *, confidence=None):
+        self.code = code
+        self.confidence = confidence
+        super().__init__(code)
+
 def normalize_ocr_text(text: str) -> str:
     """统一全半角并去掉 OCR/按钮中的空格、符号和表情。"""
     normalized = unicodedata.normalize("NFKC", text or "")
@@ -101,7 +109,7 @@ def _recognize_captcha_sync(
 
     width, height = image.size
     if width < 100 or height < 80:
-        raise RuntimeError(f"验证码图片尺寸异常：{width}x{height}")
+        raise OCRRecognitionError('InvalidImageSize')
 
     # 顶部要求中的序号是红色。只保留红色像素，可以避免正文汉字和
     # 下方 1/2/3/4 编号干扰序号识别。
@@ -141,9 +149,7 @@ def _recognize_captcha_sync(
         if 1 <= int(value) <= candidate_count
     ]
     if len(set(valid_indexes)) != 1:
-        raise RuntimeError(
-            f"OCR 无法确定图片要求的第几个字：{index_text!r}"
-        )
+        raise OCRRecognitionError('InstructionIndexAmbiguous')
     target_index = valid_indexes[0]
 
     # 下半部分按候选数量等分。每格左侧约 35% 是“1.”这样的编号，
@@ -222,15 +228,18 @@ class OCRService:
             except TimeoutError:
                 log.warning('OCR recognition timeout')
                 return OCRResult(Outcome.TIMEOUT, error_type='TimeoutError')
+            except OCRRecognitionError as error:
+                log.warning('event=ocr_failed code=%s', error.code)
+                return OCRResult(Outcome.FAILED, error_type=error.code)
             except Exception as error:
                 log.warning('OCR recognition error_type=%s', type(error).__name__)
                 return OCRResult(Outcome.FAILED, error_type=type(error).__name__)
 
     async def recognize_captcha(self, image_bytes, candidate_charset, candidate_count):
-        """Legacy tuple adapter for offline images; never resolves remote security checks."""
+        """Tuple adapter preserving safe failure codes without OCR text."""
         result = await self.recognize(image_bytes, candidate_charset, candidate_count, positional=True)
         if result.outcome != Outcome.SUCCESS:
-            raise RuntimeError(result.error_type)
+            raise OCRRecognitionError(result.error_type, confidence=result.confidence)
         return result.target_index, result.text, result.confidence
 
     async def close(self):
