@@ -39,6 +39,20 @@ class ExportService:
         self.cfg, self.dialogue, self.queries, self.cache = cfg, dialogue, queries, cache
         self.bot = bot
 
+    async def from_pages(self, task, pages, *, status='unknown', reason='local_page_collection'):
+        if not pages.text:
+            raise ValueError('empty_result')
+        if not pages.paginated:
+            return JRQueryResult('text', pages.text, export_status=status, fallback_reason=reason)
+        # Called only after PaginationService has confirmed the complete sequence.
+        async with self.cache.lock:
+            path = confined(self.cfg.cache, self.cfg.cache / uuid.uuid4().hex / 'result.txt')
+            path.parent.mkdir(parents=True, exist_ok=False)
+            await self.queries.attach_file(task, str(path), 'jr_result.txt')
+            await asyncio.to_thread(path.write_bytes, pages.text.encode('utf-8'))
+        return JRQueryResult('file', file_path=str(path), file_name='jr_result.txt',
+                             export_status=status, fallback_reason=reason)
+
     async def download(self, task, client, message):
         name = jr_original_file_name(message)
         # Fixed disk basename avoids both POSIX traversal and Windows reserved device names.

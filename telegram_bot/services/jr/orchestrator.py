@@ -4,7 +4,7 @@ import time
 from telethon.errors import FloodWaitError
 from ...clients.userbot_manager import AccountUnavailable
 from ...models.enums import QueryState
-from ...models.query import JRQueryResult, QueryReport
+from ...models.query import QueryReport
 from ...storage.repositories.query_repository import result_from_row
 from ...utils.keyed_locks import KeyedLocks
 from .cache_service import jr_cache_key, CacheInconsistent
@@ -92,15 +92,16 @@ class Orchestrator:
                         return await self._hold(task, QueryState.MANUAL, 'verification_after_purchase')
                     if classify(reply) != 'result' or find_buy_button(reply):
                         return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_not_confirmed')
-                exported, status, reason = await self.exports.attempt(task, client, reply, query_after_id)
-                if exported:
-                    result = exported
+                if getattr(reply, 'document', None):
+                    result, _, _ = await self.exports.attempt(task, client, reply, query_after_id)
+                    if not result:
+                        return await self._hold(task, QueryState.PENDING_REVIEW, 'document_download_failed')
                 else:
                     await self.repository.transition(task, QueryState.COLLECTING, source_id=reply.id)
-                    content = await self.pagination.collect(client, reply)
-                    if not content:
+                    pages = await self.pagination.collect_result(client, reply)
+                    if not pages.text:
                         return await self._hold(task, QueryState.PENDING_REVIEW, 'empty_result')
-                    result = JRQueryResult('text', content, export_status=status, fallback_reason=reason)
+                    result = await self.exports.from_pages(task, pages)
                 async with self.cache.lock:
                     await self.repository.complete(task, result, time.time(), self.manager.cfg.cache_ttl)
             return await self._deliver(task, result, 'query_completed')

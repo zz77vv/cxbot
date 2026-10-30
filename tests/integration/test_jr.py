@@ -130,8 +130,8 @@ async def test_verification_resubmits_and_exports_with_new_id(setup_jr,client,db
     jr.verification.ocr.recognize_captcha.return_value=(1,'字',0.9)
     jr.verification.dialogue.wait.return_value=message('验证通过',id=12)
     target.submit.side_effect=[message(id=10),message(id=20)]
-    target.ready.side_effect=[prompt,message('🔍共1条信息\nfixture result',id=21)]
-    exports.attempt=AsyncMock(return_value=(None,'none','no_export_button'))
+    target.ready.side_effect=[prompt,message(id=21,document=True)]
+    exports.attempt=AsyncMock(return_value=(JRQueryResult('text','fixture result'),'member',''))
     report=await jr.execute('u1','fixture')
     assert report.state==QueryState.SUCCESS
     prompt.click.assert_awaited_once_with(0,1)
