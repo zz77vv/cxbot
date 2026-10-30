@@ -9,6 +9,7 @@ from ...models.enums import QueryState
 from ...target_bots import JR, JR_EXPORT_KEYWORDS, JR_FREE_EXPORT_KEYWORDS, JR_EXPORT_SUCCESS_KEYWORDS
 from ...utils.paths import confined
 from ...utils.message_format import split_text_by_lines
+from ...utils.user_messages import state_text, reason_text
 from .result_parser import normalize_jr_full_result
 
 log = logging.getLogger(__name__)
@@ -17,7 +18,7 @@ log = logging.getLogger(__name__)
 def jr_original_file_name(message):
     name = (getattr(getattr(message, 'file', None), 'name', '') or '').strip()
     name = re.split(r'[\\/]', name)[-1].strip()
-    return re.sub(r'[\x00-\x1f]', '_', name) or f'jr_export_{message.id}.bin'
+    return re.sub(r'[\x00-\x1f]', '_', name) or f'巨人导出_{message.id}.bin'
 
 
 def jr_message_matches_export_request(message, *, baseline_id, query_after_id, target_bot_id=None):
@@ -48,9 +49,9 @@ class ExportService:
         async with self.cache.lock:
             path = confined(self.cfg.cache, self.cfg.cache / uuid.uuid4().hex / 'result.txt')
             path.parent.mkdir(parents=True, exist_ok=False)
-            await self.queries.attach_file(task, str(path), 'jr_result.txt')
+            await self.queries.attach_file(task, str(path), '巨人查询结果.txt')
             await asyncio.to_thread(path.write_bytes, pages.text.encode('utf-8'))
-        return JRQueryResult('file', file_path=str(path), file_name='jr_result.txt',
+        return JRQueryResult('file', file_path=str(path), file_name='巨人查询结果.txt',
                              export_status=status, fallback_reason=reason)
 
     async def download(self, task, client, message):
@@ -132,6 +133,6 @@ class ExportService:
     async def notify(self, task, state, reason):
         try:
             await self.bot.send_message(chat_id=self.cfg.admin_id,
-                text=f'⚠️ JR 任务 {task}\n状态：{state}\n原因：{reason}\n请核实目标机器人记录；系统不会自动重做。')
+                text=f'⚠️ 巨人查询任务 {task}\n状态：{state_text(state)}\n原因：{reason_text(reason)}\n请核实目标机器人记录；系统不会自动重做。')
         except Exception as error:
             log.error('Admin notification failed task=%s error_type=%s', task, type(error).__name__)

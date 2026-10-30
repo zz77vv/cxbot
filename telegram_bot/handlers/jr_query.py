@@ -1,5 +1,6 @@
 import re
 from .guards import protected
+from ..utils.user_messages import state_text, reason_text
 
 JR_ROUTE = re.compile(r'^/jr(?:@\w+)?(?:\+|\s|$)', re.I)
 
@@ -25,5 +26,5 @@ def make_handler(ctx):
         status = await update.effective_message.reply_text('⏳ 正在检查缓存、任务状态和可用账号...')
         # update_id is durable across retries; identical updates cannot submit twice.
         report = await ctx.jr.execute(f'{update.effective_chat.id}:{update.update_id}', text)
-        await status.edit_text(f'任务：{report.task_id or "未创建"}\n状态：{report.state.value}\n说明：{report.reason}')
+        await status.edit_text(f'任务：{report.task_id or "未创建"}\n状态：{state_text(report.state)}\n说明：{reason_text(report.reason)}')
     return handle

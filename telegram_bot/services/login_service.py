@@ -43,7 +43,7 @@ class LoginService:
             return '登录仅限管理员私聊。'
         async with self.lock:
             if time.time() < self.cooldown_until:
-                return 'Telegram 限流冷却中，请稍后再试。'
+                return '电报请求受限，正在冷却等待，请稍后再试。'
             old = self.attempts.get(user)
             if old and time.monotonic() < old.expires:
                 return '已有登录流程，请继续输入或先 /cancel。'
@@ -81,7 +81,7 @@ class LoginService:
             except FloodWaitError as error:
                 self.cooldown_until = time.time() + max(1, error.seconds)
                 await self._drop(user)
-                return 'Telegram 要求等待，登录已退出；冷却结束后重新 /login。'
+                return '电报要求等待，登录已退出；冷却结束后重新 /login。'
             except asyncio.CancelledError:
                 await self._drop(user)
                 raise
@@ -93,19 +93,19 @@ class LoginService:
                     'PhoneCodeExpiredError': '验证码已过期',
                     'PasswordHashInvalidError': '两步验证密码错误',
                     'PhoneNumberInvalidError': '手机号无效',
-                    'PhoneNumberBannedError': '该号码被 Telegram 限制',
+                    'PhoneNumberBannedError': '该号码被电报限制',
                     'TimeoutError': '连接或流程超时，外部登录结果需核实',
-                    'FileExistsError': 'Session 已存在，未覆盖',
-                    'ApiIdInvalidError': 'API_ID 与 API_HASH 无效或不匹配，请在服务器本地核对',
-                    'PhoneNumberFloodError': '该号码登录请求过多，请停止重试并等待 Telegram 限制解除',
-                    'AuthRestartError': 'Telegram 要求重新开始授权，请先停止当前尝试',
-                    'ConnectionError': '连接 Telegram 失败',
+                    'FileExistsError': '登录凭据已存在，未覆盖',
+                    'ApiIdInvalidError': '应用编号与应用密钥无效或不匹配，请在服务器本地核对',
+                    'PhoneNumberFloodError': '该号码登录请求过多，请停止重试并等待电报限制解除',
+                    'AuthRestartError': '电报要求重新开始授权，请先停止当前尝试',
+                    'ConnectionError': '连接电报失败',
                 }
                 reason = reasons.get(type(error).__name__, '当前步骤的格式、连接、保存或授权验证失败')
                 if isinstance(error, ValueError) and attempt.phase == 'phone' and attempt.client is None:
                     reason = '手机号格式无效，请使用加号和国际区号加数字，不含空格或其他字符'
                 await self._drop(user)
-                return f'登录未完成：{reason}，已退出。请重新 /login。若已保存 Session，可通过 /status 或重启核实。'
+                return f'登录未完成：{reason}，已退出。请重新 /login。若已保存登录凭据，可通过 /status 核实。'
             finally:
                 value = None
 
@@ -116,7 +116,7 @@ class LoginService:
             attempt.phone = value.strip().lstrip('+')
             if self.manager.exists(attempt.phone):
                 await self._drop(self.cfg.admin_id)
-                return '该账号已存在 Session，禁止覆盖；请使用 /status 查看状态。'
+                return '该账号已存在登录凭据，禁止覆盖；请使用 /status 查看状态。'
             attempt.client = self.manager.login_client()
             await attempt.client.connect()
             try:
@@ -129,7 +129,7 @@ class LoginService:
                 response = await attempt.client.send_code_request('+' + attempt.phone)
             attempt.code_hash = response.phone_code_hash
             attempt.phase = 'code'
-            return '请输入 Telegram 登录验证码；如验证码被 Telegram 判定为转发而失效，请取消后使用服务器本地登录。'
+            return '请输入电报登录验证码；如验证码被电报判定为转发而失效，请取消后使用服务器本地登录。'
         if attempt.phase == 'code':
             code = re.sub(r'[\s-]', '', value)
             if not re.fullmatch(r'[0-9]{4,8}', code):
@@ -148,7 +148,7 @@ class LoginService:
         account = await self.manager.enroll(attempt.phone, session)
         await self._drop(self.cfg.admin_id)
         self.on_added()
-        return f'登录成功：{account.key}；Session 已安全保存并重新连接验证，已纳入账号管理。'
+        return f'登录成功：{account.key}；登录凭据已安全保存并重新连接验证，已纳入账号管理。'
 
     async def expire(self):
         async with self.lock:
