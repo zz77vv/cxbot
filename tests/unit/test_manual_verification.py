@@ -8,8 +8,8 @@ from telegram_bot.services.jr.manual_verification import ManualVerificationServi
 from telegram_bot.services.jr.verification_service import VerificationError
 
 
-@pytest.mark.parametrize('action,changed', [(0, False), (1, False), (0, True)])
-async def test_manual_choice_then_explicit_continue(cfg, action, changed):
+@pytest.mark.parametrize('changed,delete_fails', [(False, False), (False, True), (True, False)])
+async def test_manual_choice_continues_once_after_verification(cfg, changed, delete_fails):
     def prompt(photo_id):
         return SimpleNamespace(
             id=9, text='验证', media=True, photo=SimpleNamespace(id=photo_id),
@@ -22,7 +22,7 @@ async def test_manual_choice_then_explicit_continue(cfg, action, changed):
                              get_messages=AsyncMock(return_value=latest))
     target = SimpleNamespace(submit=AsyncMock(return_value=SimpleNamespace(id=10)),
                              ready=AsyncMock(return_value=SimpleNamespace(id=11)))
-    cleanup = SimpleNamespace(edit_reply_markup=AsyncMock())
+    cleanup = SimpleNamespace(edit_reply_markup=AsyncMock(), delete=AsyncMock(side_effect=RuntimeError if delete_fails else None))
     bot = SimpleNamespace()
     service = ManualVerificationService(bot, SimpleNamespace(), target, cfg)
 
@@ -41,15 +41,10 @@ async def test_manual_choice_then_explicit_continue(cfg, action, changed):
         target.submit.assert_not_awaited()
         return await select(kwargs['reply_markup'], 0)
 
-    async def show_continue(chat, text, **kwargs):
-        current.click.assert_awaited_once_with(0, 0)
-        target.submit.assert_not_awaited()
-        return await select(kwargs['reply_markup'], action)
-
     bot.send_photo = AsyncMock(side_effect=show_image)
-    bot.send_message = AsyncMock(side_effect=show_continue)
-    if changed or action:
-        code = 'manual_prompt_changed' if changed else 'manual_query_abandoned'
+    bot.send_message = AsyncMock()
+    if changed:
+        code = 'manual_prompt_changed'
         with pytest.raises(VerificationError, match=code):
             await service.solve(client, current, 'fixture', task='test', account='1234')
         target.submit.assert_not_awaited()
@@ -59,4 +54,6 @@ async def test_manual_choice_then_explicit_continue(cfg, action, changed):
         reply, after = await service.solve(client, current, 'fixture', task='test', account='1234')
         assert reply.id == 11 and after == 10
         target.submit.assert_awaited_once_with(client, 'fixture')
+    bot.send_message.assert_not_awaited()
+    assert cleanup.delete.await_count == int(not changed)
     assert not service.choices
