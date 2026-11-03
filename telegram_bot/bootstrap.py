@@ -31,7 +31,7 @@ from .services.jr.export_service import ExportService
 from .services.jr.ocr_service import OCRService
 from .services.jr.cache_service import CacheService
 from .services.jr.orchestrator import Orchestrator
-from .services.jr.verification_service import VerificationService
+from .services.jr.manual_verification import ManualVerificationService
 from .handlers.registration import register
 from .utils.process_lock import ProcessLock
 
@@ -56,8 +56,9 @@ async def run(cfg):
         application = create_application(cfg)
         exports = ExportService(cfg, dialogue, queries, cache, application.bot)
         ocr = OCRService(cfg.ocr_timeout)
-        verification = VerificationService(ocr, dialogue, target, cfg)
-        jr = Orchestrator(manager, queries, selector, target, PaginationService(target), exports, cache, verification)
+        verification = ManualVerificationService(application.bot, dialogue, target, cfg)
+        jr = Orchestrator(manager, queries, selector, target, PaginationService(target), exports, cache, None,
+                          manual_verification=verification)
         checkins = CheckinService(manager, CheckinRepository(db), dialogue)
         logins = LoginService(cfg, manager, lambda: checkins.start(lifecycle.registry))
         ctx = AppContext(cfg, db, manager, checkins,

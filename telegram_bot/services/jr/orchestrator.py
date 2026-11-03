@@ -17,10 +17,12 @@ log = logging.getLogger(__name__)
 
 
 class Orchestrator:
-    def __init__(self, manager, repository, selector, target, pagination, exports, cache, verification):
+    def __init__(self, manager, repository, selector, target, pagination, exports, cache, verification,
+                 *, manual_verification=None):
         self.manager, self.repository, self.selector = manager, repository, selector
         self.target, self.pagination, self.exports, self.cache = target, pagination, exports, cache
         self.verification = verification
+        self.manual_verification = manual_verification
         self.locks = KeyedLocks()
         self.accepting = True
         self.active = set()
@@ -92,8 +94,15 @@ class Orchestrator:
                     await progress.advance(4)
                 if kind == 'manual':
                     try:
-                        reply, query_after_id = await self.verification.solve(client, reply, text)
+                        if self.manual_verification is None:
+                            reply, query_after_id = await self.verification.solve(client, reply, text)
+                        else:
+                            reply, query_after_id = await self.manual_verification.solve(
+                                client, reply, text, task=task, account=account.key)
                     except VerificationError as error:
+                        if str(error) == 'manual_query_abandoned':
+                            await self.repository.transition(task, QueryState.FAILED, str(error))
+                            return QueryReport(task, QueryState.FAILED, str(error))
                         log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
                         return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
                     await self.repository.transition(task, QueryState.SUBMITTED,

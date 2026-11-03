@@ -2,7 +2,7 @@ import logging
 from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
                        BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats,
                        BotCommandScopeAllChatAdministrators)
-from telegram.ext import CommandHandler, MessageHandler, filters
+from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from telegram.error import NetworkError, BadRequest
 from .menu_sync import missing_private_chat, set_admin_menu
 from . import start_help, checkin, balance, jr_query, status, login
@@ -28,9 +28,13 @@ def register(application, ctx):
                  'qd': checkin.make_handler(ctx), 'jf': balance.make_handler(ctx),
                  'status': state, 'login': login.start_handler(ctx), 'cancel': login.cancel_handler(ctx)}
     application.add_handler(MessageHandler(filters.ALL, admin_guard(ctx)), group=-1)
+    manual = getattr(ctx.jr, 'manual_verification', None)
+    if manual is not None:
+        application.add_handler(CallbackQueryHandler(manual.callback, pattern=r'^jrverify:[\w-]{22}:[0-9]+$'))
     for command, callback in callbacks.items():
         if command == 'jr':
-            application.add_handler(MessageHandler(filters.TEXT & filters.Regex(jr_query.JR_ROUTE), callback))
+            application.add_handler(MessageHandler(filters.TEXT & filters.Regex(jr_query.JR_ROUTE), callback,
+                                                   block=manual is None))
         else:
             application.add_handler(CommandHandler(command, callback))
 
