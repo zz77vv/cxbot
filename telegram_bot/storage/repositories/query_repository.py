@@ -45,8 +45,33 @@ class QueryRepository:
         return await self.db.fetchone(f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
                                      (account, excluding, *UNRESOLVED)) is not None
 
-    async def reserve(self, task, account, now, limit=5):
+    async def cooldown_until(self, account):
+        row = await self.db.fetchone('SELECT until_at FROM jr_query_cooldowns WHERE phone=?', (account,))
+        return row[0] if row else 0
+
+    async def refresh_cooldown(self, account, now):
         async with self.db.transaction() as c:
+            membership = await one(c, 'SELECT status FROM jr_membership WHERE phone=?', (account,))
+            if not membership or membership[0] != 'member':
+                await c.execute('INSERT INTO jr_query_cooldowns VALUES(?,?) ON CONFLICT(phone) '
+                                'DO UPDATE SET until_at=MAX(until_at,excluded.until_at)', (account, now + 60))
+
+    async def defer_cooldown(self, task, account, seconds, now):
+        """Only a confirmed rejection before purchase can return to scheduling."""
+        async with self.db.transaction() as c:
+            await c.execute('INSERT INTO jr_query_cooldowns VALUES(?,?) ON CONFLICT(phone) '
+                            'DO UPDATE SET until_at=MAX(until_at,excluded.until_at)', (account, now + seconds))
+            await c.execute("INSERT INTO jr_membership VALUES(?,'free',?) ON CONFLICT(phone) "
+                            "DO UPDATE SET status='free',checked_at=excluded.checked_at", (account, now))
+            await c.execute("UPDATE query_tasks SET state='prepared',phase='jr_cooldown',"
+                            "reason='jr_query_cooldown',reserved=0,account=NULL,usage_date=NULL,"
+                            "updated_at=? WHERE task_id=?", (now, task))
+
+    async def reserve(self, task, account, now, limit=5, *, cooldown_seconds=0):
+        async with self.db.transaction() as c:
+            cooldown = await one(c, 'SELECT until_at FROM jr_query_cooldowns WHERE phone=?', (account,))
+            if cooldown and cooldown[0] > now:
+                return False
             blocked = await one(c, f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
                                 (account, task, *UNRESOLVED))
             if blocked:
@@ -58,6 +83,9 @@ class QueryRepository:
             if (not membership or membership[0] != 'member') and (used[0] if used else 0) + held[0] >= limit:
                 return False
             await c.execute("UPDATE query_tasks SET account=?,usage_date=?,reserved=1,state='submitting',phase='submitting',updated_at=? WHERE task_id=?", (account, day, now, task))
+            if cooldown_seconds and (not membership or membership[0] != 'member'):
+                await c.execute('INSERT INTO jr_query_cooldowns VALUES(?,?) ON CONFLICT(phone) '
+                                'DO UPDATE SET until_at=MAX(until_at,excluded.until_at)', (account, now + cooldown_seconds))
             return True
 
     async def transition(self, task, state, reason='', *, sent_id=None, source_id=None):
@@ -75,6 +103,8 @@ class QueryRepository:
                 await c.execute('INSERT INTO jr_daily_usage VALUES(?,?,1) ON CONFLICT(phone,usage_date) DO UPDATE SET query_count=query_count+1', (account, row['usage_date']))
                 if result.export_status in ('member', 'free'):
                     await c.execute('INSERT INTO jr_membership VALUES(?,?,?) ON CONFLICT(phone) DO UPDATE SET status=excluded.status,checked_at=excluded.checked_at', (account, result.export_status, now))
+                    if result.export_status == 'member':
+                        await c.execute('DELETE FROM jr_query_cooldowns WHERE phone=?', (account,))
             await c.execute("UPDATE query_tasks SET state='success',phase='complete',reason='',reserved=0,result_type=?,result_text=?,file_path=?,file_name=?,export_status=?,updated_at=? WHERE task_id=?",
                             (result.kind, result.text, result.file_path, result.file_name, result.export_status, now, task))
             if not from_cache:

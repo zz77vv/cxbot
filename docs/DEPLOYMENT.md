@@ -15,7 +15,9 @@ python scripts/migrate_database.py --database-copy /srv/v2-rehearsal/bot.db
 snapshot 使用 SQLite backup，源连接为 mode=ro，不用直接复制正在写入的 .db 文件。目标存在时拒绝覆盖。迁移脚本取得进程锁，打开副本前再生成 .backup-时间-随机值。迁移仅支持源码中确认的旧表、主键及字段，未知结构停止；不得为了迁移成功手动删除未知表。
 
 3. 核对五类旧业务表行数、抽样记录和缓存文件引用。检查 last_sign_time 单 phone 表是否展开三个目标；历史 timestamp 不会变成 V2 的“确认成功”时间。迁移不删除历史用量、会员、封禁或过期缓存记录；缓存清理由运行期独立执行。
-4. schema_migrations 当前为 1。新增 checkin_state、checkin_attempts、query_tasks、file_leases、account_cooldowns；旧缓存缺失 result_type/file_path/file_name 时仅增加字段。事务失败回滚。高于 1 的版本拒绝降级运行。
+4. schema_migrations 当前为 2。版本 1 新增 checkin_state、checkin_attempts、query_tasks、file_leases、account_cooldowns；旧缓存缺失 result_type/file_path/file_name 时仅增加字段。版本 2 仅新增 jr_query_cooldowns，独立保存每个协议号的 JR 查询冷却截止时间，不与 Telegram FloodWait 共用。事务失败回滚。高于 2 的版本拒绝降级运行。
+
+版本 2 回滚到版本 1 代码时，需要同时恢复升级前的数据库快照；旧代码会拒绝打开版本 2。先核实升级后的外部操作和在途任务，禁止仅删除版本号或表来强行降级。
 
 ## 新部署或旧版切换
 

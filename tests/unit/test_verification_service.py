@@ -77,6 +77,13 @@ async def test_callback_only_success_allows_one_resubmission(verification, clien
     verification.target.submit.assert_awaited_once()
 
 
+async def test_verified_resubmission_returns_explicit_cooldown(verification, client):
+    verification.target.ready.return_value = message('⏱️ 查询过于频繁，请 12 秒后再试。', id=21)
+    reply, after = await verification.solve(client, prompt(), 'fixture')
+    assert reply.id == 21 and after == 20
+    verification.target.submit.assert_awaited_once()
+
+
 async def test_direct_result_does_not_resubmit(verification, client):
     current = prompt()
     verification.dialogue.wait.return_value = message('未查询到结果', id=12)

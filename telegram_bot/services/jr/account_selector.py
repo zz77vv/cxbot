@@ -13,11 +13,13 @@ class RateLimitEncountered(RuntimeError):
 class AccountExclusion:
     account: str
     reason: str
+    retry_at: float = 0
 
 
 class NoEligibleAccountError(RuntimeError):
     def __init__(self, exclusions: tuple[AccountExclusion, ...]):
         self.exclusions = exclusions
+        self.retry_at = min((item.retry_at for item in exclusions if item.retry_at), default=0)
         reasons = {item.reason for item in exclusions}
         self.reason = next(iter(reasons)) if len(reasons) == 1 else 'no_eligible_account'
         if not exclusions:
@@ -39,6 +41,11 @@ class AccountSelector:
                 return AccountExclusion(a.key, 'account_not_online')
             if not await self.memberships.eligible(a.key):
                 return AccountExclusion(a.key, 'daily_query_limit_reached')
+            until = await self.queries.cooldown_until(a.key)
+            if until > time.time():
+                return AccountExclusion(a.key, 'jr_query_cooldown', until)
+            if a.lock.locked():
+                return AccountExclusion(a.key, 'account_busy', time.time() + 1)
             if await self.queries.unresolved_account(a.key):
                 return AccountExclusion(a.key, 'account_has_unresolved_task')
             async with self.semaphore:

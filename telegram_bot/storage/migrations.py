@@ -26,7 +26,7 @@ async def validate_legacy(conn):
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
         tables = {row[0] for row in await cur.fetchall()}
     allowed = set(LEGACY_COLUMNS) | {'schema_migrations', 'checkin_state', 'checkin_attempts',
-                                     'query_tasks', 'file_leases', 'account_cooldowns'}
+                                     'query_tasks', 'file_leases', 'account_cooldowns', 'jr_query_cooldowns'}
     unknown = {t for t in tables if not t.startswith('sqlite_')} - allowed
     if unknown:
         raise SchemaError('数据库包含未知表；停止迁移，请人工审核结构')
@@ -49,7 +49,8 @@ async def validate_legacy(conn):
             raise SchemaError(f'{table} 主键不兼容')
     if 'schema_migrations' in tables:
         row = await one(conn, 'SELECT MAX(version) FROM schema_migrations')
-        if row[0] is not None and row[0] > 1:
+        version = row[0] or 0
+        if version > 2:
             raise SchemaError('数据库版本高于当前程序，禁止降级运行')
         expected = {
             'schema_migrations': {'version'},
@@ -59,6 +60,8 @@ async def validate_legacy(conn):
             'file_leases': {'path','owner'},
             'account_cooldowns': {'phone','until_at'},
         }
+        if version >= 2:
+            expected['jr_query_cooldowns'] = {'phone', 'until_at'}
         for table, required in expected.items():
             if table not in tables or {r[1] for r in await columns(conn, table)} != required:
                 raise SchemaError(f'{table} V2 结构不兼容；停止迁移')
@@ -102,3 +105,7 @@ async def migrate(db):
             if name not in existing:
                 await conn.execute(f'ALTER TABLE jr_result_cache ADD COLUMN {name} {definition}')
         await conn.execute('INSERT OR IGNORE INTO schema_migrations VALUES (1)')
+        # Version 2 adds JR query cooldowns without changing version 1 tables.
+        await conn.execute('CREATE TABLE IF NOT EXISTS jr_query_cooldowns '
+                           '(phone TEXT PRIMARY KEY,until_at REAL NOT NULL)')
+        await conn.execute('INSERT OR IGNORE INTO schema_migrations VALUES (2)')
