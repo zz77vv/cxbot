@@ -3,6 +3,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from .guards import protected
+from . import jr_batch
 from ..services.jr.progress import JRProgress
 from ..models.enums import QueryState
 
@@ -22,6 +23,7 @@ def parse_request(text, bot_username=None):
 
 def make_handler(ctx):
     seen = OrderedDict()
+    batch_handler = jr_batch.make_handler(ctx)
 
     @protected(ctx)
     async def handle(update, context):
@@ -57,4 +59,11 @@ def make_handler(ctx):
                     break
                 if completed:
                     seen.pop(key)
-    return handle
+    async def route(update, context):
+        message = update.effective_message
+        text = parse_request(message.text, context.bot.username) if message else None
+        if text and len([line for line in text.splitlines() if line.strip()]) > 1:
+            return await batch_handler(update, context)
+        return await handle(update, context)
+
+    return route
