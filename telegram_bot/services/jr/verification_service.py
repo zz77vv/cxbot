@@ -113,7 +113,7 @@ class VerificationService:
             if kind == 'manual':
                 current = reply
                 continue
-            if kind not in ('result', 'failed'):
+            if kind not in ('result', 'failed', 'cooldown'):
                 raise VerificationError('unrecognized_interaction_reply')
             return reply, query_after_id
         raise VerificationError('attempts_exhausted')

@@ -10,7 +10,8 @@ from ...utils.keyed_locks import KeyedLocks
 from .cache_service import jr_cache_key, CacheInconsistent
 from .account_selector import NoEligibleAccountError, RateLimitEncountered
 from .pagination import CollectedPages, ManualVerification
-from .result_parser import classify, find_buy_button
+from .result_parser import classify, find_buy_button, parse_query_cooldown
+from .scheduler import AccountScheduler
 from .verification_service import VerificationError
 
 log = logging.getLogger(__name__)
@@ -70,75 +71,74 @@ class Orchestrator:
                     async with self.cache.lock:
                         await self.repository.complete(task, cached, time.time(), self.manager.cfg.cache_ttl, from_cache=True)
                 return await self._deliver(task, cached, 'cache_hit', progress=progress)
-            ranked = await self.selector.rank()
-            if not ranked:
-                await self.repository.transition(task, QueryState.FAILED, 'no_eligible_account')
-                return QueryReport(task, QueryState.FAILED, 'no_eligible_account')
-            # Only one chosen account may receive the request. A limit never triggers rotation.
-            account = ranked[0][0]
-            async with self.manager.operation(account) as client:
-                if not await self.repository.reserve(task, account.key, time.time()):
-                    await self.repository.transition(task, QueryState.FAILED, 'account_busy_or_daily_limit')
-                    return QueryReport(task, QueryState.FAILED, 'account_busy_or_daily_limit')
-                if progress is not None:
-                    await progress.advance(3)
-                sent = await self.target.submit(client, text)
-                query_after_id = sent.id
-                await self.repository.transition(task, QueryState.SUBMITTED, sent_id=sent.id)
-                reply = await self.target.ready(client, sent.id)
-                if not reply:
-                    return await self._hold(task, QueryState.PENDING_REVIEW, 'query_reply_timeout', progress=progress)
-                await self.repository.transition(task, QueryState.SUBMITTED, source_id=reply.id)
-                kind = classify(reply)
-                if progress is not None:
-                    await progress.advance(4)
-                if kind == 'manual':
-                    try:
-                        if self.manual_verification is None:
-                            reply, query_after_id = await self.verification.solve(client, reply, text)
-                        else:
-                            reply, query_after_id = await self.manual_verification.solve(
-                                client, reply, text, task=task, account=account.key)
-                    except VerificationError as error:
-                        log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
-                        return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
-                    await self.repository.transition(task, QueryState.SUBMITTED,
-                                                     sent_id=query_after_id, source_id=reply.id)
-                    kind = classify(reply)
-                if kind == 'failed':
-                    await self.repository.transition(task, QueryState.FAILED, 'explicit_target_failure')
-                    return QueryReport(task, QueryState.FAILED, 'explicit_target_failure')
-                if kind != 'result':
-                    return await self._hold(task, QueryState.PENDING_REVIEW, 'unrecognized_target_reply', progress=progress)
-                buy = find_buy_button(reply)
-                if buy:
-                    await self.repository.transition(task, QueryState.PURCHASING, source_id=reply.id)
-                    reply = await self.target.click_and_wait(client, reply, buy)
+            scheduler = AccountScheduler(self.manager, self.selector, self.repository)
+            while True:
+                async with scheduler.acquire(task, progress=progress) as (account, client):
+                    if progress is not None:
+                        await progress.advance(3)
+                    sent = await self.target.submit(client, text)
+                    await self.repository.refresh_cooldown(account.key, time.time())
+                    query_after_id = sent.id
+                    await self.repository.transition(task, QueryState.SUBMITTED, sent_id=sent.id)
+                    reply = await self.target.ready(client, sent.id)
                     if not reply:
-                        return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_reply_timeout', progress=progress)
-                    if classify(reply) == 'manual':
-                        return await self._hold(task, QueryState.MANUAL, 'verification_after_purchase', progress=progress)
-                    if classify(reply) != 'result' or find_buy_button(reply):
-                        return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_not_confirmed', progress=progress)
-                if progress is not None:
-                    await progress.advance(5)
-                if getattr(reply, 'document', None):
+                        return await self._hold(task, QueryState.PENDING_REVIEW, 'query_reply_timeout', progress=progress)
+                    await self.repository.transition(task, QueryState.SUBMITTED, source_id=reply.id)
+                    kind = classify(reply)
                     if progress is not None:
-                        await progress.advance(6, detail='正在接收目标返回的结果文件。')
-                    result, _, _ = await self.exports.attempt(task, client, reply, query_after_id)
-                    if not result:
-                        return await self._hold(task, QueryState.PENDING_REVIEW, 'document_download_failed', progress=progress)
-                else:
-                    await self.repository.transition(task, QueryState.COLLECTING, source_id=reply.id)
-                    pages = await self.pagination.collect_result(client, reply, on_page=progress.page if progress is not None else None)
-                    if not pages.text:
-                        return await self._hold(task, QueryState.PENDING_REVIEW, 'empty_result', progress=progress)
+                        await progress.advance(4)
+                    if kind == 'manual':
+                        try:
+                            if self.manual_verification is None:
+                                reply, query_after_id = await self.verification.solve(client, reply, text)
+                            else:
+                                reply, query_after_id = await self.manual_verification.solve(
+                                    client, reply, text, task=task, account=account.key)
+                        except VerificationError as error:
+                            log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
+                            return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
+                        await self.repository.transition(task, QueryState.SUBMITTED,
+                                                         sent_id=query_after_id, source_id=reply.id)
+                        await self.repository.refresh_cooldown(account.key, time.time())
+                        kind = classify(reply)
+                    if kind == 'cooldown':
+                        await self.repository.defer_cooldown(task, account.key, parse_query_cooldown(reply), time.time())
+                        continue
+                    if kind == 'failed':
+                        await self.repository.transition(task, QueryState.FAILED, 'explicit_target_failure')
+                        return QueryReport(task, QueryState.FAILED, 'explicit_target_failure')
+                    if kind != 'result':
+                        return await self._hold(task, QueryState.PENDING_REVIEW, 'unrecognized_target_reply', progress=progress)
+                    buy = find_buy_button(reply)
+                    if buy:
+                        await self.repository.transition(task, QueryState.PURCHASING, source_id=reply.id)
+                        reply = await self.target.click_and_wait(client, reply, buy)
+                        if not reply:
+                            return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_reply_timeout', progress=progress)
+                        if classify(reply) == 'manual':
+                            return await self._hold(task, QueryState.MANUAL, 'verification_after_purchase', progress=progress)
+                        if classify(reply) != 'result' or find_buy_button(reply):
+                            return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_not_confirmed', progress=progress)
                     if progress is not None:
-                        await progress.advance(6)
-                    result = await self.exports.from_pages(task, pages,
-                        force_file=progress is not None and not progress.text_fits(pages.text))
-                async with self.cache.lock:
-                    await self.repository.complete(task, result, time.time(), self.manager.cfg.cache_ttl)
+                        await progress.advance(5)
+                    if getattr(reply, 'document', None):
+                        if progress is not None:
+                            await progress.advance(6, detail='正在接收目标返回的结果文件。')
+                        result, _, _ = await self.exports.attempt(task, client, reply, query_after_id)
+                        if not result:
+                            return await self._hold(task, QueryState.PENDING_REVIEW, 'document_download_failed', progress=progress)
+                    else:
+                        await self.repository.transition(task, QueryState.COLLECTING, source_id=reply.id)
+                        pages = await self.pagination.collect_result(client, reply, on_page=progress.page if progress is not None else None)
+                        if not pages.text:
+                            return await self._hold(task, QueryState.PENDING_REVIEW, 'empty_result', progress=progress)
+                        if progress is not None:
+                            await progress.advance(6)
+                        result = await self.exports.from_pages(task, pages,
+                            force_file=progress is not None and not progress.text_fits(pages.text))
+                    async with self.cache.lock:
+                        await self.repository.complete(task, result, time.time(), self.manager.cfg.cache_ttl)
+                break
             return await self._deliver(task, result, 'query_completed', progress=progress)
         except asyncio.CancelledError:
             row = await self.repository.get(task)

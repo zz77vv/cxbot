@@ -235,8 +235,10 @@ async def test_edit_failure_does_not_affect_business_and_not_modified_is_success
     bot.send_message.assert_not_awaited()
 
 
-async def test_concurrent_requests_edit_only_their_own_message(setup_jr,bot):
+async def test_concurrent_requests_edit_only_their_own_message(setup_jr,bot,db):
     jr,repo,target,*_=setup_jr
+    async with db.transaction() as c:
+        await c.execute("INSERT INTO jr_membership VALUES('10001','member',0)")
     first=JRProgress(SimpleNamespace(edit_text=AsyncMock(),delete=AsyncMock()),interval=0)
     second=JRProgress(SimpleNamespace(edit_text=AsyncMock(),delete=AsyncMock()),interval=0)
     target.ready.side_effect=[message('🔍共1条信息\n结果甲'),message('🔍共1条信息\n结果乙')]

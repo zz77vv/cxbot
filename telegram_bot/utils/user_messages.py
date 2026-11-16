@@ -24,6 +24,8 @@ REASONS = {
     'daily_query_limit_reached': '今日查询次数和预留名额已达到上限。',
     'account_has_unresolved_task': '账号有尚未结案的查询任务，请先核实旧任务。',
     'account_busy_or_daily_limit': '账号已有未结案任务，或今日查询额度已用完。',
+    'jr_query_cooldown': '巨人免费协议号正在冷却，等待结束后继续选号。',
+    'account_busy': '协议号正在处理其他请求，等待空闲后重新选号。',
     'account_unavailable_before_submission': '提交前发现账号不可用，没有发送查询。',
     'account_unavailable': '账号暂不可用，请检查连接或授权状态。',
     'telegram_flood_wait_no_submission': '电报要求冷却等待，没有发送新的查询。',

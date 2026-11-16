@@ -37,6 +37,12 @@ def is_jr_pending_message(message):
     return any(k in (getattr(message, 'text', '') or '') for k in JR_PENDING_KEYWORDS)
 
 
+def parse_query_cooldown(message):
+    match = re.search(r'查询过于频繁[，,]\s*请\s*(\d{1,6})\s*秒后再试',
+                      getattr(message, 'text', '') or '')
+    return max(1, int(match.group(1))) if match else None
+
+
 def find_buy_button(message):
     generic = None
     for r, row in enumerate(getattr(message, 'buttons', None) or []):
@@ -101,6 +107,8 @@ def page_content_signature(message):
 
 
 def classify(message):
+    if parse_query_cooldown(message) is not None:
+        return 'cooldown'
     if is_verification_message(message):
         return 'manual'
     if is_jr_pending_message(message):

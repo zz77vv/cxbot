@@ -104,21 +104,24 @@ class UserbotManager:
             return account.state
 
     @asynccontextmanager
-    async def operation(self, account):
-        async with self.semaphore, account.lock:
-            if self.stopping or account.unavailable_until > time.time() or account.state != AccountState.ONLINE:
-                raise AccountUnavailable('account_unavailable')
-            if not account.client.is_connected():
-                account.state = AccountState.OFFLINE
-                raise AccountUnavailable('account_disconnected')
-            try:
-                yield account.client
-            except FloodWaitError as error:
-                await self.flood_wait(account, error.seconds)
-                raise
-            except (ConnectionError, OSError):
-                account.state = AccountState.ERROR
-                raise
+    async def operation(self, account, *, wait=True):
+        async with self.semaphore:
+            if not wait and account.lock.locked():
+                raise AccountUnavailable("account_busy")
+            async with account.lock:
+                if self.stopping or account.unavailable_until > time.time() or account.state != AccountState.ONLINE:
+                    raise AccountUnavailable('account_unavailable')
+                if not account.client.is_connected():
+                    account.state = AccountState.OFFLINE
+                    raise AccountUnavailable('account_disconnected')
+                try:
+                    yield account.client
+                except FloodWaitError as error:
+                    await self.flood_wait(account, error.seconds)
+                    raise
+                except (ConnectionError, OSError):
+                    account.state = AccountState.ERROR
+                    raise
 
     async def monitor(self):
         while not self.stopping:

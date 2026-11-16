@@ -192,6 +192,8 @@ async def test_missing_cached_file_does_not_purchase(setup_jr,db,cfg):
 
 async def test_concurrent_different_queries_same_account(setup_jr,db):
     jr,repo,target,*_=setup_jr
+    async with db.transaction() as c:
+        await c.execute("INSERT INTO jr_membership VALUES('10001','member',0)")
     reports=await asyncio.gather(jr.execute('u1','fixture 1'),jr.execute('u2','fixture 2'))
     assert all(r.state==QueryState.SUCCESS for r in reports)
     assert (await db.fetchone('SELECT query_count FROM jr_daily_usage'))[0]==2
