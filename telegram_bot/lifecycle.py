@@ -47,6 +47,9 @@ class Lifecycle:
             await self.ctx.accounts.start()
             await self.bot.start()
             for row in recovered:
+                # Manual tasks already receive a notification when they enter that state.
+                if row['state'] == 'manual' and row['delivery_state'] != 'unknown':
+                    continue
                 await self.ctx.jr.exports.notify(row['task_id'], row['state'], 'restart_requires_review')
             await self.ctx.cache.cleanup()
             self.ctx.checkins.start(self.registry)

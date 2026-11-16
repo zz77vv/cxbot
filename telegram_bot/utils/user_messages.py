@@ -56,6 +56,7 @@ REASONS = {
     'balance_pattern_not_matched': '未能从目标回复中解析积分。',
     'balance_reply_timeout': '等待积分回复超时。',
     'balance_transport_timeout': '积分查询连接超时。',
+    'balance_batch_timeout': '整次查询已到 4 分钟，此项未完成。',
     'balance_error': '积分查询发生异常。',
     'minimum_24h_interval': '距离上次签到尝试不足二十四小时，已跳过。',
     'confirmed_by_reply': '已收到目标机器人确认成功的回复。',

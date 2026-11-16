@@ -9,6 +9,7 @@ from ..clients.dialogue import find_button
 from ..target_bots import TARGETS
 
 log = logging.getLogger(__name__)
+BALANCE_BATCH_TIMEOUT = 240
 
 
 def parse_balance(text, target):
@@ -56,6 +57,18 @@ class BalanceService:
             return OperationResult(Outcome.FAILED, 'balance_error', type(error).__name__)
 
     async def all(self):
+        accounts = tuple(self.manager.accounts.values())
+        unfinished = OperationResult(Outcome.TIMEOUT, 'balance_batch_timeout')
+        results = {account.key: [(target.name, unfinished) for target in TARGETS] for account in accounts}
+
         async def per_account(account):
-            return account.key, [(t.name, await self.query(account, t)) for t in TARGETS]
-        return await asyncio.gather(*(per_account(a) for a in self.manager.accounts.values()))
+            for index, target in enumerate(TARGETS):
+                result = await self.query(account, target)
+                results[account.key][index] = target.name, result
+
+        try:
+            async with asyncio.timeout(BALANCE_BATCH_TIMEOUT):
+                await asyncio.gather(*(per_account(account) for account in accounts))
+        except TimeoutError:
+            log.warning('Balance batch timed out after %d seconds', BALANCE_BATCH_TIMEOUT)
+        return list(results.items())
