@@ -78,7 +78,7 @@ class VerificationService:
             if (confidence is None or not math.isfinite(confidence)
                     or confidence < OCR_MIN_CONFIDENCE):
                 raise VerificationError('low_or_unknown_confidence')
-            if not isinstance(index, int) or not 1 <= index <= len(candidates):
+            if index is not None and (not isinstance(index, int) or not 1 <= index <= len(candidates)):
                 raise VerificationError('invalid_target_index')
             context.stage = 'candidate_match'
             normalized = normalize_ocr_text(recognized)
