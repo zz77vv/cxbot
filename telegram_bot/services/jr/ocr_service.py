@@ -4,10 +4,11 @@ import logging
 import math
 import re
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 import warnings
 # This dependency changes the global warning filters during import.
 with warnings.catch_warnings():
@@ -101,92 +102,96 @@ def _classification_with_confidence(image_bytes: bytes, ocr_engine):
     confidence = sum(scores) / len(scores) if scores else 0.0
     return "".join(recognized), confidence
 
+def _segment_char_boxes(bw_image: Image.Image, min_width: int = 15):
+    """通过垂直投影自动切分单字边界框 (left, top, right, bottom)。"""
+    w, h = bw_image.size
+    pix = bw_image.load()
+    col_counts = [sum(1 for y in range(h) if pix[x, y] == 0) for x in range(w)]
+    segments = []
+    in_seg = False
+    start = 0
+    for x, cnt in enumerate(col_counts):
+        if cnt >= 3 and not in_seg:
+            in_seg = True
+            start = x
+        elif cnt < 3 and in_seg:
+            in_seg = False
+            if x - start >= min_width:
+                segments.append((start, x))
+    if in_seg and w - start >= min_width:
+        segments.append((start, w))
+    boxes = []
+    for left, right in segments:
+        crop = bw_image.crop((left, 0, right, h))
+        bbox = ImageOps.invert(crop).getbbox()
+        if bbox:
+            boxes.append((left + bbox[0], bbox[1], left + bbox[2], bbox[3]))
+    return boxes
+    
 def _recognize_captcha_sync(
-    image_bytes: bytes,
-    candidate_charset: str,
-    candidate_count: int,
-    ocr_engine,
+        image_bytes: bytes,
+        candidate_charset: str,
+        candidate_count: int,
+        ocr_engine,
 ):
     """
-    识别“请点击第 N 个字”类型验证码。
+    识别“点出现了两次的那个字”类型验证码。
 
-    先从上半部分的红色数字识别 N，再按照图片中的等宽位置裁出第 N
-    个汉字。Telegram 按钮的排列顺序完全不参与位置判断。
+    流程：截取下半部分 -> 中值滤波去干扰线/噪点 -> 垂直投影切分单字 ->
+    限定候选按钮字符集双视图一致识别 -> 统计频次找出唯一出现 >= 2 次的字。
     """
     if ocr_engine is None:
         ocr_engine = ddddocr.DdddOcr(beta=True, show_ad=False)
 
     with Image.open(BytesIO(image_bytes)) as source:
-        image = source.convert("RGB")
+        gray = source.convert("L")
 
-    width, height = image.size
+    width, height = gray.size
     if width < 100 or height < 80:
         raise OCRRecognitionError('InvalidImageSize')
 
-    # 顶部要求中的序号是红色。只保留红色像素，可以避免正文汉字和
-    # 下方 1/2/3/4 编号干扰序号识别。
-    instruction = image.crop((0, 0, width, max(1, int(height * 0.48))))
-    red_mask = Image.new("L", instruction.size, 255)
-    red_mask.putdata([
-        0 if (
-            red >= 110
-            and red - green >= 35
-            and red - blue >= 35
-            and red >= green * 1.25
-            and red >= blue * 1.25
-        ) else 255
-        for red, green, blue in instruction.getdata()
-    ])
+    bottom = gray.crop((0, int(height * 0.40), width, int(height * 0.96)))
+    denoised = bottom.filter(ImageFilter.MedianFilter(size=3))
+    bw = denoised.point(lambda value: 0 if value < 115 else 255)
 
-    red_bbox = ImageOps.invert(red_mask).getbbox()
-    if red_bbox:
-        left, top, right, bottom = red_bbox
-        margin_x = max(4, int((right - left) * 0.15))
-        margin_y = max(4, int((bottom - top) * 0.15))
-        red_mask = red_mask.crop((
-            max(0, left - margin_x),
-            max(0, top - margin_y),
-            min(red_mask.width, right + margin_x),
-            min(red_mask.height, bottom + margin_y),
-        ))
-    else:
-        # 极端情况下颜色压缩严重，退回到整个顶部区域识别数字。
-        red_mask = ImageOps.autocontrast(ImageOps.grayscale(instruction))
-
-    ocr_engine.set_ranges("123456789")
-    index_text = ocr_engine.classification(_pil_to_png_bytes(red_mask))
-    index_text = unicodedata.normalize('NFKC', str(index_text)).strip()
-    if not re.fullmatch(r'[1-9]', index_text) or int(index_text) > candidate_count:
+    boxes = _segment_char_boxes(bw)
+    if len(boxes) < 2:
         raise OCRRecognitionError('InstructionIndexAmbiguous')
-    target_index = int(index_text)
 
-    # Preserve more of the glyph than the old 35%-95% crop. Stay within
-    # the selected slot: never include a neighbouring answer. This remains
-    # specific to the supported equal-width JR layout, not a text detector.
-    slot_width = width / candidate_count
-    slot_left = (target_index - 1) * slot_width
-    word_crop = image.crop((
-        int(slot_left + slot_width * 0.20),
-        int(height * 0.45),
-        int(slot_left + slot_width),
-        int(height * 0.96),
-    ))
     ocr_engine.set_ranges(candidate_charset)
-    # Exactly two views, on the existing single worker. Preserve antialiased
-    # strokes instead of destroying them with a fixed binary threshold.
-    # Agreement is required; never select whichever view has the best score.
-    views = (word_crop, ImageOps.autocontrast(ImageOps.grayscale(word_crop)))
-    readings = [_classification_with_confidence(_pil_to_png_bytes(view), ocr_engine)
-                for view in views]
-    texts = [normalize_ocr_text(text) for text, _ in readings]
-    if not texts[0] or texts[0] != texts[1]:
+    recognized_chars = []
+    char_scores = {}
+
+    for box in boxes:
+        view_gray = ImageOps.expand(denoised.crop(box), border=12, fill=255)
+        view_bw = ImageOps.expand(bw.crop(box), border=12, fill=255)
+        readings = [
+            _classification_with_confidence(_pil_to_png_bytes(view), ocr_engine)
+            for view in (view_gray, view_bw)
+        ]
+        texts = [normalize_ocr_text(text) for text, _ in readings]
+        scores = [score for _, score in readings]
+        if not texts[0] or texts[0] != texts[1]:
+            continue
+        if any(score is None or not math.isfinite(score) or not 0 <= score <= 1 for score in scores):
+            continue
+        ch = texts[0][0]
+        min_score = min(scores)
+        if min_score >= OCR_MIN_CONFIDENCE:
+            recognized_chars.append(ch)
+            char_scores[ch] = min(char_scores.get(ch, min_score), min_score)
+
+    if not recognized_chars:
         raise OCRRecognitionError('RecognitionDisagreement')
-    scores = [score for _, score in readings]
-    if any(score is None or not math.isfinite(score) or not 0 <= score <= 1 for score in scores):
-        raise OCRRecognitionError('InvalidConfidence')
-    return target_index, readings[0][0], min(scores)
 
+    counts = Counter(recognized_chars)
+    duplicates = [ch for ch, cnt in counts.items() if cnt >= 2]
+    if len(duplicates) != 1:
+        raise OCRRecognitionError('RecognitionDisagreement')
 
+    target_char = duplicates[0]
+    return None, target_char, char_scores[target_char]
+    
 @dataclass(frozen=True)
 class OCRResult:
     outcome: Outcome
