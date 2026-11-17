@@ -89,14 +89,24 @@ class Orchestrator:
                         await progress.advance(4)
                     if kind == 'manual':
                         try:
-                            if self.manual_verification is None:
+                            if self.verification is not None:
                                 reply, query_after_id = await self.verification.solve(client, reply, text)
-                            else:
+                            elif self.manual_verification is not None:
                                 reply, query_after_id = await self.manual_verification.solve(
                                     client, reply, text, task=task, account=account.key)
+                            else:
+                                raise VerificationError('no_verification_service')
                         except VerificationError as error:
-                            log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
-                            return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
+                            if self.verification is None or self.manual_verification is None:
+                                log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
+                                return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
+                                log.warning('event=jr_auto_ocr_fallback task=%s reason=%s', task, error)
+                                try:
+                                    reply, query_after_id = await self.manual_verification.solve(
+                                        client, reply, text, task=task, account=account.key)
+                                except VerificationError as manual_error:
+                                    log.warning('event=jr_verification_failed task=%s reason=%s', task, manual_error)
+                                    return await self._hold(task, QueryState.MANUAL, f'verification_failed:{manual_error}', progress=progress)
                         await self.repository.transition(task, QueryState.SUBMITTED,
                                                          sent_id=query_after_id, source_id=reply.id)
                         await self.repository.refresh_cooldown(account.key, time.time())
