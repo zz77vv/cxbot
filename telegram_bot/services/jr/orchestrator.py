@@ -97,9 +97,8 @@ class Orchestrator:
                             else:
                                 raise VerificationError('no_verification_service')
                         except VerificationError as error:
-                            if self.verification is None or self.manual_verification is None:
-                                log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
-                                return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
+                            # 自动 OCR 失败 → 有兜底则转人工，无兜底则挂起待核实
+                            if self.verification is not None and self.manual_verification is not None:
                                 log.warning('event=jr_auto_ocr_fallback task=%s reason=%s', task, error)
                                 try:
                                     reply, query_after_id = await self.manual_verification.solve(
@@ -107,6 +106,9 @@ class Orchestrator:
                                 except VerificationError as manual_error:
                                     log.warning('event=jr_verification_failed task=%s reason=%s', task, manual_error)
                                     return await self._hold(task, QueryState.MANUAL, f'verification_failed:{manual_error}', progress=progress)
+                            else:
+                                log.warning('event=jr_verification_failed task=%s reason=%s', task, error)
+                                return await self._hold(task, QueryState.MANUAL, f'verification_failed:{error}', progress=progress)
                         await self.repository.transition(task, QueryState.SUBMITTED,
                                                          sent_id=query_after_id, source_id=reply.id)
                         await self.repository.refresh_cooldown(account.key, time.time())
