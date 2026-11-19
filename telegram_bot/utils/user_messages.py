@@ -31,6 +31,7 @@ REASONS = {
     'telegram_flood_wait_no_submission': '电报要求冷却等待，没有发送新的查询。',
     'telegram_flood_wait': '电报请求受限，请等待冷却结束。',
     'query_reply_timeout': '查询已提交，但等待回复超时，请先核实目标记录。',
+    'partial_page_timeout': '翻页超时，查询只收集到部分结果，请先核实目标记录。',
     'explicit_target_failure': '目标机器人明确返回查询失败或积分不足。',
     'unrecognized_target_reply': '目标回复格式无法确认，请人工核实。',
     'purchase_reply_timeout': '购买后的回复超时，结果不确定；系统不会再次购买。',

@@ -111,6 +111,14 @@ class QueryRepository:
                 await c.execute('INSERT INTO jr_result_cache(cache_key,result_text,source_phone,created_at,expires_at,result_type,file_path,file_name) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_text=excluded.result_text,source_phone=excluded.source_phone,created_at=excluded.created_at,expires_at=excluded.expires_at,result_type=excluded.result_type,file_path=excluded.file_path,file_name=excluded.file_name',
                                 (row['cache_key'], result.text, account, now, now + ttl, result.kind, result.file_path, result.file_name))
 
+    async def save_partial(self, task, result, reason):
+        """Keep the task unresolved and store the result without adding a cache entry."""
+        async with self.db.transaction() as c:
+            await c.execute("UPDATE query_tasks SET state='pending_review',reason=?,updated_at=?,"
+                            'result_type=?,result_text=?,file_path=?,file_name=?,export_status=? WHERE task_id=?',
+                            (reason, time.time(), result.kind, result.text, result.file_path,
+                             result.file_name, result.export_status, task))
+
     async def attach_file(self, task, path, name):
         async with self.db.transaction() as c:
             await c.execute('UPDATE query_tasks SET file_path=?,file_name=? WHERE task_id=?', (path, name, task))

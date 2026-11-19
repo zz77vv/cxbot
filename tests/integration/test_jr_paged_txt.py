@@ -1,8 +1,11 @@
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
 from conftest import message, button
 from telegram_bot.models.enums import QueryState
 from telegram_bot.services.jr.result_parser import parse_result_header, parse_page_info, classify, normalize_jr_full_result
+from telegram_bot.services.jr.target_client import TargetClient
 
 # Reuse the real repositories, cache, pagination and delivery fixture.
 from test_jr import setup_jr
@@ -92,13 +95,13 @@ async def test_single_page_header_takes_priority_over_navigation(setup_jr,bot):
 
 
 @pytest.mark.parametrize('case', ['skip','total_changed','marker_missing','count_changed',
-                                 'duplicate','no_next','timeout','unknown_end','verification'])
+                                 'duplicate','no_next','unknown_end','verification'])
 async def test_incomplete_results_never_delivered_or_cached(setup_jr,bot,db,monkeypatch,case):
     monkeypatch.setattr('telegram_bot.services.jr.pagination.JR_PAGE_INTERVAL',0)
     jr,repo,target,*_=setup_jr
     first=page(1)
     variants={'skip':page(3),'total_changed':page(2,8),'marker_missing':message('🔍共39条信息\nB'),
-              'count_changed':page(2,count=40),'duplicate':page(1),'timeout':None,
+              'count_changed':page(2,count=40),'duplicate':page(1),
               'unknown_end':message('格式变化'),'verification':message('安全验证')}
     if case=='no_next':first=page(1,next_button=False)
     target.ready.return_value=first
@@ -110,3 +113,65 @@ async def test_incomplete_results_never_delivered_or_cached(setup_jr,bot,db,monk
     assert (await repo.get(report.task_id))['delivery_state']=='not_started'
     await jr.execute('incomplete-repeated','fixture')
     assert target.submit.await_count==1
+
+
+@pytest.mark.parametrize('recover', [True, False])
+async def test_timeout_at_page_60_continues_or_delivers_marked_partial(setup_jr, bot, db, monkeypatch, recover):
+    monkeypatch.setattr('telegram_bot.services.jr.pagination.JR_PAGE_INTERVAL', 0)
+    jr, repo, target, *_ = setup_jr
+    target.ready.return_value = page(1, total=150, count=750)
+    responses = [page(n, total=150, count=750) for n in range(2, 61)]
+    responses.append(TimeoutError() if recover else None)
+    if recover:
+        responses.extend(page(n, total=150, count=750, next_button=n<150) for n in range(62, 151))
+    target.click_and_wait.side_effect = responses
+    target.confirm_next_page = AsyncMock(return_value=page(61, total=150, count=750) if recover else None)
+
+    report = await jr.execute('large-pages', 'fixture')
+
+    target.submit.assert_awaited_once()
+    target.confirm_next_page.assert_awaited_once()
+    assert target.confirm_next_page.call_args.args[1].id == 70
+    bot.send_document.assert_awaited_once()
+    row = await repo.get(report.task_id)
+    assert row['delivery_state'] == 'delivered'
+    payload = Path(report.result.file_path).read_text(encoding='utf-8')
+    if recover:
+        assert report.state == QueryState.SUCCESS
+        assert target.click_and_wait.await_count == 149
+        assert payload.endswith('记录 150')
+        assert await db.fetchone('SELECT * FROM jr_result_cache') is not None
+    else:
+        assert report.state == QueryState.PENDING_REVIEW
+        assert target.click_and_wait.await_count == 60
+        assert '已收集 60/150 页' in payload and payload.endswith('记录 60')
+        assert '部分结果' in bot.send_document.call_args.kwargs['filename']
+        assert row['result_type'] == 'file'
+        assert await db.fetchone('SELECT * FROM jr_result_cache') is None
+        assert (await jr.execute('large-pages-repeat', 'fixture')).duplicate
+        target.submit.assert_awaited_once()
+        bot.send_document.assert_awaited_once()
+
+
+async def test_confirm_next_page_only_accepts_linked_reply_or_original_edit(cfg, client):
+    current = page(60, total=150)
+    unlinked = page(61, total=150)
+    linked = page(61, total=150)
+    linked.reply_to_msg_id = current.id
+    edited = page(61, total=150)
+    edited.id = current.id
+    wrong_sender = page(61, total=150)
+    wrong_sender.id = current.id
+    wrong_sender.sender_id = 1000
+
+    async def wait(client, bot, after_id, predicate, timeout, **kwargs):
+        assert after_id == current.id and kwargs['original'] is current
+        assert not predicate(unlinked) and not predicate(wrong_sender)
+        assert predicate(edited) and predicate(linked)
+        return edited
+
+    target = TargetClient(SimpleNamespace(wait=wait), cfg)
+    result = await target.confirm_next_page(client, current, lambda m: parse_page_info(m) == (61, 150))
+    assert result is edited
+    current.click.assert_not_awaited()
+    client.send_message.assert_not_awaited()

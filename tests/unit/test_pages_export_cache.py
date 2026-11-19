@@ -27,7 +27,8 @@ async def test_pagination_and_repeated_page(monkeypatch):
 
 async def test_pagination_hard_limit_and_timeout():
     first=message('第1页，共2页\nfixture',buttons=[[button('下一页')]])
-    target=SimpleNamespace(click_and_wait=AsyncMock(return_value=None))
+    target=SimpleNamespace(click_and_wait=AsyncMock(return_value=None),
+                           confirm_next_page=AsyncMock(return_value=None))
     with pytest.raises(ValueError): await PaginationService(target).collect(None,first,max_pages=1)
     with pytest.raises(TimeoutError): await PaginationService(target).collect(None,first)
 

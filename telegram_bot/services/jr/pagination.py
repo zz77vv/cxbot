@@ -15,6 +15,8 @@ class CollectedPages:
     page_count: int
     paginated: bool
     total_records: int | None = None
+    total_pages: int | None = None
+    timed_out: bool = False
 
 
 class PaginationService:
@@ -22,7 +24,10 @@ class PaginationService:
         self.target = target
 
     async def collect(self, client, first_message, max_pages=JR_MAX_PAGES):
-        return (await self.collect_result(client, first_message, max_pages)).text
+        pages = await self.collect_result(client, first_message, max_pages)
+        if pages.timed_out:
+            raise TimeoutError('next_page_timeout')
+        return pages.text
 
     async def collect_result(self, client, first_message, max_pages=JR_MAX_PAGES, *, on_page=None):
         if not 1 <= max_pages <= JR_MAX_PAGES:
@@ -34,11 +39,11 @@ class PaginationService:
         first_info = parse_page_info(first_message)
         paginated = first_info[1] > 1 if first_info else bool(find_next_page_button(first_message))
 
-        def completed():
-            if expected_total is not None and set(pages) != set(range(1, expected_total + 1)):
+        def collected(*, timed_out=False):
+            if not timed_out and expected_total is not None and set(pages) != set(range(1, expected_total + 1)):
                 raise ValueError('incomplete_page_sequence')
             return CollectedPages(normalize_jr_full_result('\n\n'.join(pages.values())),
-                                  len(pages), paginated, records)
+                                  len(pages), paginated, records, expected_total, timed_out)
 
         for index in range(max_pages):
             if is_verification_message(current):
@@ -73,17 +78,34 @@ class PaginationService:
                 except Exception as error:
                     log.warning('event=page_progress_failed error_type=%s', type(error).__name__)
             if info and number == total:
-                return completed()
+                return collected()
             button = find_next_page_button(current)
             if not button:
                 if info and number < total:
                     raise ValueError('next_page_button_missing')
-                return completed()
+                return collected()
             if index + 1 == max_pages:
                 raise ValueError('page_limit_exceeded')
-            changed = await self.target.click_and_wait(client, current, button)
+            try:
+                changed = await self.target.click_and_wait(client, current, button)
+            except TimeoutError:
+                changed = None
             if not changed:
-                raise TimeoutError('next_page_timeout')
+                def is_next_page(candidate):
+                    if (expected_total is None or classify(candidate) != 'result'
+                            or parse_page_info(candidate) != (number + 1, expected_total)
+                            or page_content_signature(candidate) in seen):
+                        return False
+                    header = parse_result_header(candidate)
+                    return header is None or records is None or header.total_records == records
+
+                try:
+                    changed = await self.target.confirm_next_page(client, current, is_next_page)
+                except (TimeoutError, OSError):
+                    changed = None
+                if not changed:
+                    log.warning('event=jr_page_timeout collected=%s total=%s', len(pages), expected_total)
+                    return collected(timed_out=True)
             if (getattr(changed, 'text', '') or '') == (getattr(current, 'text', '') or ''):
                 raise ValueError('page_did_not_advance')
             new_info = parse_page_info(changed)

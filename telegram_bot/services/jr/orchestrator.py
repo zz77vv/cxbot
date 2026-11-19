@@ -133,6 +133,7 @@ class Orchestrator:
                             return await self._hold(task, QueryState.PENDING_REVIEW, 'purchase_not_confirmed', progress=progress)
                     if progress is not None:
                         await progress.advance(5)
+                    state, reason = QueryState.SUCCESS, 'query_completed'
                     if getattr(reply, 'document', None):
                         if progress is not None:
                             await progress.advance(6, detail='正在接收目标返回的结果文件。')
@@ -148,10 +149,15 @@ class Orchestrator:
                             await progress.advance(6)
                         result = await self.exports.from_pages(task, pages,
                             force_file=progress is not None and not progress.text_fits(pages.text))
+                        if pages.timed_out:
+                            state, reason = QueryState.PENDING_REVIEW, 'partial_page_timeout'
                     async with self.cache.lock:
-                        await self.repository.complete(task, result, time.time(), self.manager.cfg.cache_ttl)
+                        if state == QueryState.PENDING_REVIEW:
+                            await self.repository.save_partial(task, result, reason)
+                        else:
+                            await self.repository.complete(task, result, time.time(), self.manager.cfg.cache_ttl)
                 break
-            return await self._deliver(task, result, 'query_completed', progress=progress)
+            return await self._deliver(task, result, reason, progress=progress, state=state)
         except asyncio.CancelledError:
             row = await self.repository.get(task)
             if row['state'] != 'success':
@@ -187,7 +193,7 @@ class Orchestrator:
             await self.exports.notify(task, state.value, reason)
         return QueryReport(task, state, reason)
 
-    async def _deliver(self, task, result, reason, *, progress=None):
+    async def _deliver(self, task, result, reason, *, progress=None, state=QueryState.SUCCESS):
         try:
             if progress is not None:
                 await progress.advance(7)
@@ -202,5 +208,5 @@ class Orchestrator:
                 await progress.fail(task, QueryState.PENDING_REVIEW, 'result_saved_no_automatic_resend')
             else:
                 await self.exports.notify(task, 'delivery_unknown', 'result_saved_no_automatic_resend')
-            return QueryReport(task, QueryState.SUCCESS, 'delivery_requires_review', result)
-        return QueryReport(task, QueryState.SUCCESS, reason, result)
+            return QueryReport(task, state, 'delivery_requires_review', result)
+        return QueryReport(task, state, reason, result)

@@ -43,15 +43,20 @@ class ExportService:
     async def from_pages(self, task, pages, *, status='unknown', reason='local_page_collection', force_file=False):
         if not pages.text:
             raise ValueError('empty_result')
-        if not pages.paginated and not force_file:
+        if not pages.paginated and not force_file and not pages.timed_out:
             return JRQueryResult('text', pages.text, export_status=status, fallback_reason=reason)
-        # Called only after PaginationService has confirmed the complete sequence.
+        name, text = '巨人查询结果.txt', pages.text
+        if pages.timed_out:
+            name = '巨人查询部分结果.txt'
+            count = (f'已收集 {pages.page_count}/{pages.total_pages} 页' if pages.total_pages is not None
+                     else f'已收集 {pages.page_count} 页，总页数未知')
+            text = f'部分结果（翻页超时）\n{count}\n\n{text}'
         async with self.cache.lock:
             path = confined(self.cfg.cache, self.cfg.cache / uuid.uuid4().hex / 'result.txt')
             path.parent.mkdir(parents=True, exist_ok=False)
-            await self.queries.attach_file(task, str(path), '巨人查询结果.txt')
-            await asyncio.to_thread(path.write_bytes, pages.text.encode('utf-8'))
-        return JRQueryResult('file', file_path=str(path), file_name='巨人查询结果.txt',
+            await self.queries.attach_file(task, str(path), name)
+            await asyncio.to_thread(path.write_bytes, text.encode('utf-8'))
+        return JRQueryResult('file', file_path=str(path), file_name=name,
                              export_status=status, fallback_reason=reason)
 
     async def download(self, task, client, message):
