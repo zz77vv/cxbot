@@ -7,6 +7,7 @@ from ...models.query import JRQueryResult
 
 
 PLACEHOLDERS = ','.join('?' for _ in UNRESOLVED)
+RELEASABLE_EXCEPTION = "state IN ('pending_review','manual','unknown') AND delivery_state!='sending'"
 
 
 def result_from_row(row):
@@ -40,6 +41,20 @@ class QueryRepository:
 
     async def recent_metadata(self, limit=100):
         return await self.db.fetchall('SELECT task_id,account,state,phase,sent_id,source_id,delivery_state,delivery_cursor FROM query_tasks ORDER BY created_at DESC LIMIT ?', (limit,))
+
+    async def list_exceptions(self):
+        return await self.db.fetchall(
+            f'SELECT task_id,state,reason FROM query_tasks WHERE {RELEASABLE_EXCEPTION} '
+            'ORDER BY created_at DESC LIMIT 20')
+
+    async def release_exception(self, task):
+        async with self.db.transaction() as c:
+            async with c.execute(
+                "UPDATE query_tasks SET state='failed',reason='operator_closed_unverified:' || reason,"
+                f'reserved=0,updated_at=? WHERE task_id=? AND {RELEASABLE_EXCEPTION}',
+                (time.time(), task),
+            ) as cursor:
+                return cursor.rowcount == 1
 
     async def unresolved_account(self, account, excluding=''):
         return await self.db.fetchone(f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
