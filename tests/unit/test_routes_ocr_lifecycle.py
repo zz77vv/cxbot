@@ -36,7 +36,7 @@ def telegram_update(text,application,user_id=123):
     application.bot._bot_user = User(999, 'TestBot', True, username='testbot')
     update=Update.de_json({'update_id':1,'message':{'message_id':1,'date':1,
         'chat':{'id':user_id,'type':'private'},'from':{'id':user_id,'is_bot':False,'first_name':'Test'},
-        'text':text,'entities':[{'type':'bot_command','offset':0,'length':3}]}},application.bot)
+        'text':text,'entities':[{'type':'bot_command','offset':0,'length':len(text.split()[0])}]}},application.bot)
     return update
 
 
@@ -47,6 +47,15 @@ def test_actual_ptb_route_matches_once(cfg,text):
     assert set(callbacks)==set(COMMANDS)
     update=telegram_update(text,app)
     assert sum(bool(h.check_update(update)) for h in app.handlers[0])==1
+
+
+def test_jrbatch_has_no_menu_entry_or_handler(cfg):
+    app=Application.builder().token('12345:'+'X'*30).build()
+    callbacks=register(app,context(cfg))
+    update=telegram_update('/jrbatch first\nsecond',app)
+    assert 'jrbatch' not in COMMANDS
+    assert 'jrbatch' not in callbacks
+    assert not any(h.check_update(update) for h in app.handlers[0])
 
 
 async def test_nonadmin_denied_by_real_handler(cfg):

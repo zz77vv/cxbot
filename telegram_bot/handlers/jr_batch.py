@@ -1,32 +1,18 @@
 """Sequential batches using the existing single-query service."""
 import asyncio
 import logging
-import re
-
-from .guards import protected
 from ..models.enums import QueryState
 from ..services.jr.progress import JRProgress
 
 log = logging.getLogger(__name__)
 
 
-def parse_items(text):
-    match = re.match(r'^/(?:jrbatch|jr)(?:@\w+)?(?:\+|\s+)(.*)$', (text or '').strip(), re.I | re.S)
-    if not match:
-        return []
-    return list(dict.fromkeys(line.strip() for line in match[1].splitlines() if line.strip()))
-
-
-def make_handler(ctx):
+def make_runner(ctx):
     active = set()
 
-    @protected(ctx)
-    async def handle(update, context):
+    async def run(update, lines):
         message = update.effective_message
-        items = parse_items(message.text)
-        if not items:
-            await message.reply_text('用法：/jrbatch 后每行一条查询内容。\n每条沿用 /jr 查询和付费规则。')
-            return
+        items = list(dict.fromkeys(lines))
         batch_id = f'{update.effective_chat.id}:{update.update_id}:batch'
         if batch_id in active:
             return
@@ -65,4 +51,4 @@ def make_handler(ctx):
         finally:
             active.discard(batch_id)
 
-    return handle
+    return run

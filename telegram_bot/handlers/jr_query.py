@@ -23,7 +23,7 @@ def parse_request(text, bot_username=None):
 
 def make_handler(ctx):
     seen = OrderedDict()
-    batch_handler = jr_batch.make_handler(ctx)
+    run_batch = jr_batch.make_runner(ctx)
 
     @protected(ctx)
     async def handle(update, context):
@@ -31,7 +31,11 @@ def make_handler(ctx):
         if text is None:
             return
         if not text:
-            await update.effective_message.reply_text('用法：/jr 查询内容\n或 /jr+查询内容')
+            await update.effective_message.reply_text('用法：/jr 查询内容\n或 /jr+查询内容\n批量查询时，每行一条。')
+            return
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) > 1:
+            await run_batch(update, lines)
             return
         request_id = f'{update.effective_chat.id}:{update.update_id}'
         if request_id in seen:
@@ -59,11 +63,4 @@ def make_handler(ctx):
                     break
                 if completed:
                     seen.pop(key)
-    async def route(update, context):
-        message = update.effective_message
-        text = parse_request(message.text, context.bot.username) if message else None
-        if text and len([line for line in text.splitlines() if line.strip()]) > 1:
-            return await batch_handler(update, context)
-        return await handle(update, context)
-
-    return route
+    return handle
