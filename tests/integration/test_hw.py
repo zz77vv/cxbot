@@ -102,7 +102,7 @@ async def test_hw_handler_only_accepts_admin_private_and_preserves_content(cfg):
     username = SimpleNamespace(id=cfg.admin_id + 1)
     chat = SimpleNamespace(id=cfg.admin_id, type='private')
     reply = AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock()))
-    msg = SimpleNamespace(text='/hw@fixture 查询  内容\n下一行', reply_text=reply)
+    msg = SimpleNamespace(text='/hw@fixture 查询  内容', reply_text=reply)
     update = SimpleNamespace(effective_user=username, effective_chat=chat, effective_message=msg, update_id=2)
     handle = make_handler(ctx)
 
@@ -113,4 +113,92 @@ async def test_hw_handler_only_accepts_admin_private_and_preserves_content(cfg):
     execute.assert_not_awaited()
     chat.type = 'private'
     await handle(update, None)
-    execute.assert_awaited_once_with(f'{cfg.admin_id}:2', '查询  内容\n下一行')
+    execute.assert_awaited_once_with(f'{cfg.admin_id}:2', '查询  内容')
+
+
+@pytest.mark.parametrize('stop_reason', ['', 'hw_export_timeout', 'existing_task_no_resubmission'])
+async def test_hw_batch_dedupes_in_order_and_stops_without_replaying(cfg, stop_reason):
+    from telegram_bot.clients.request_tracker import RequestTracker
+    from telegram_bot.handlers.hw_query import make_handler
+    from telegram_bot.models.query import QueryReport
+
+    order = []
+    async def execute(request, text):
+        order.append((request, text))
+        if text == '第二条' and stop_reason:
+            return QueryReport('needs-review', QueryState.PENDING_REVIEW, stop_reason,
+                               duplicate=stop_reason == 'existing_task_no_resubmission')
+        return QueryReport('delivered', QueryState.SUCCESS, 'query_completed')
+
+    ctx = SimpleNamespace(config=cfg, requests=RequestTracker(), hw=SimpleNamespace(execute=execute))
+    progress = SimpleNamespace(edit_text=AsyncMock())
+    msg = SimpleNamespace(text='/hw@fixture 第一  条\n\n 第二条 \n第一  条\n第三条',
+                          reply_text=AsyncMock(return_value=progress))
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=cfg.admin_id),
+                             effective_chat=SimpleNamespace(id=cfg.admin_id, type='private'),
+                             effective_message=msg, update_id=23)
+    await make_handler(ctx)(update, None)
+    req = f'{cfg.admin_id}:23'
+    assert order[:2] == [(req, '第一  条'), (f'{req}:batch:2', '第二条')]
+    final = progress.edit_text.call_args.args[0]
+    if stop_reason:
+        assert len(order) == 2
+        assert '未提交' in final and '不会重发' in final
+    else:
+        assert order[2:] == [(f'{req}:batch:3', '第三条')]
+        assert '成功 3' in final
+
+
+async def test_hw_batch_sends_mixed_results_once_even_on_replayed_update(setup_jr, manager, bot, client):
+    from pathlib import Path
+    from telegram_bot.clients.request_tracker import RequestTracker
+    from telegram_bot.handlers.hw_query import make_handler
+
+    _, queries, _, exports, _ = setup_jr
+    cfg = manager.cfg
+    history = []
+    first = hw_message('查询结果\n模拟文本一', 11, reply_to_msg_id=10)
+    second = hw_message('查询结果\n模拟文本二', 21, reply_to_msg_id=20,
+                        buttons=[[KeyboardButtonCallback('导出', b'export')]])
+    file = hw_message('已导出为文件', 22, reply_to_msg_id=21, document=True,
+                      file=SimpleNamespace(name='模拟原文件.txt'))
+
+    async def submit(target, text):
+        sent_id, response = (10, first) if text == '甲' else (20, second)
+        history.append(response)
+        return SimpleNamespace(id=sent_id, peer_id=SimpleNamespace(user_id=900))
+
+    async def click(*button):
+        history.append(file)
+
+    async def download(message, file):
+        Path(file).write_bytes(b'mixed\r\noriginal')
+        return file
+
+    delivered = []
+
+    async def capture(**kwargs):
+        delivered.append((kwargs['filename'], kwargs['document'].read()))
+
+    client.send_message.side_effect = submit
+    client.get_messages.side_effect = lambda target, **kwargs: history[::-1][:kwargs['limit']]
+    client.download_media.side_effect = download
+    second.click.side_effect = click
+    bot.send_document.side_effect = capture
+    service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
+    ctx = SimpleNamespace(config=cfg, requests=RequestTracker(), hw=service)
+    progress = SimpleNamespace(edit_text=AsyncMock())
+    message = SimpleNamespace(text='/hw 甲\n乙\n甲', reply_text=AsyncMock(return_value=progress))
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=cfg.admin_id),
+                             effective_chat=SimpleNamespace(id=cfg.admin_id, type='private'),
+                             effective_message=message, update_id=25)
+    handle = make_handler(ctx)
+    await handle(update, None)
+    assert '成功 2' in progress.edit_text.call_args.args[0]
+    await make_handler(ctx)(update, None)
+    assert [call.args for call in client.send_message.await_args_list] == [
+        ('@hewuqi', '甲'), ('@hewuqi', '乙')]
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.kwargs['text'] == first.text
+    assert delivered == [('模拟原文件.txt', b'mixed\r\noriginal')]
+    second.click.assert_awaited_once_with(0, 0)
