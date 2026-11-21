@@ -10,6 +10,7 @@ from ..models.enums import Outcome
 from ..target_bots import TARGETS, MIN_INTERVAL, RANDOM_OFFSET_MAX
 
 log = logging.getLogger(__name__)
+MANUAL_CHECKIN_TIMEOUT = 240
 
 
 class CheckinService:
@@ -79,10 +80,22 @@ class CheckinService:
             return OperationResult(Outcome.UNAVAILABLE, 'account_unavailable')
 
     async def manual(self):
+        accounts = tuple(self.manager.accounts.values())
+        unfinished = OperationResult(Outcome.PENDING_REVIEW, 'checkin_batch_timeout')
+        results = {a.key: [(target.name, unfinished) for target in TARGETS] for a in accounts}
+
         async def per_account(a):
-            await asyncio.sleep(self.rng.uniform(0, min(15, len(self.manager.accounts))))
-            return a.key, [(t.name, await self.run_one(a, t)) for t in TARGETS]
-        return await asyncio.gather(*(per_account(a) for a in self.manager.accounts.values()))
+            await asyncio.sleep(self.rng.uniform(0, min(15, len(accounts))))
+            for index, target in enumerate(TARGETS):
+                result = await self.run_one(a, target)
+                results[a.key][index] = target.name, result
+
+        try:
+            async with asyncio.timeout(MANUAL_CHECKIN_TIMEOUT):
+                await asyncio.gather(*(per_account(a) for a in accounts))
+        except TimeoutError:
+            log.warning('Manual check-in timed out')
+        return list(results.items())
 
     async def scheduler(self, account, target):
         while True:

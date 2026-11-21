@@ -62,10 +62,12 @@ async def run(cfg):
         manual_verify = ManualVerificationService(application.bot, dialogue, target, cfg)
         jr = Orchestrator(manager, queries, selector, target, PaginationService(target), exports, cache, auto_verify,
                           manual_verification=manual_verify)
-        checkins = CheckinService(manager, CheckinRepository(db), dialogue)
+        checkin_repository = CheckinRepository(db)
+        checkins = CheckinService(manager, checkin_repository, dialogue)
         logins = LoginService(cfg, manager, lambda: checkins.start(lifecycle.registry))
         ctx = AppContext(cfg, db, manager, checkins,
-                         balances, AccountStatusService(manager), jr, ocr, cache, UserRepository(db), RequestTracker(),
+                         balances, AccountStatusService(manager, checkin_repository), jr, ocr, cache,
+                         UserRepository(db), RequestTracker(),
                          logins, HWQueryService(cfg, manager, dialogue, queries, exports))
         lifecycle = Lifecycle(ctx, BotApplication(application, cfg), queries)
         register(application, ctx)

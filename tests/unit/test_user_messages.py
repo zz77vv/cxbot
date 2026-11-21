@@ -31,7 +31,8 @@ def test_reasons_do_not_expose_english_or_unknown_payload(code):
 
 def user_context(cfg):
     return SimpleNamespace(config=cfg,requests=RequestTracker(),
-        status=SimpleNamespace(snapshot=AsyncMock(return_value=[('10001','online','',0),('10002','error','TimeoutError',0)])),
+        status=SimpleNamespace(snapshot=AsyncMock(return_value=[('10001','online','',0),('10002','error','TimeoutError',0)]),
+                               checkin_status=AsyncMock(return_value={'10001':[('巨人','success')]})),
         jr=SimpleNamespace(active=set(),accepting=True,execute=AsyncMock(return_value=QueryReport('task123',QueryState.MANUAL,'verification_failed:ocr:LowConfidence'))),
         balances=SimpleNamespace(all=AsyncMock(return_value=[('10001',[('巨人',OperationResult(Outcome.TIMEOUT,'balance_reply_timeout'))])])),
         checkins=SimpleNamespace(manual=AsyncMock(return_value=[('10001',[('巨人',OperationResult(Outcome.SKIPPED,'minimum_24h_interval'))])])) )
@@ -47,6 +48,8 @@ async def test_real_handlers_render_chinese(cfg,module,expected):
     await module.make_handler(ctx)(update,SimpleNamespace(bot=SimpleNamespace(username='fixturebot')))
     rendered='\n'.join(str(c.args[0]) for c in msg.reply_text.await_args_list)+ '\n'.join(str(c.args[0]) for c in edited.edit_text.await_args_list)
     assert expected in rendered
+    if module is status:
+        assert '最近签到：巨人 成功' in rendered
     for raw in ('online','TimeoutError','minimum_24h_interval','LowConfidence','manual','True'):
         assert raw not in rendered
     if module is jr_query:

@@ -8,6 +8,7 @@ from ...models.query import JRQueryResult
 
 PLACEHOLDERS = ','.join('?' for _ in UNRESOLVED)
 RELEASABLE_EXCEPTION = "state IN ('pending_review','manual','unknown') AND delivery_state!='sending'"
+DELIVERY_REVIEW = "state='success' AND delivery_state='unknown' AND result_type IS NOT NULL"
 
 
 def result_from_row(row):
@@ -44,12 +45,23 @@ class QueryRepository:
 
     async def list_exceptions(self):
         return await self.db.fetchall(
-            f'SELECT task_id,state,reason FROM query_tasks WHERE {RELEASABLE_EXCEPTION} '
+            f'SELECT task_id,state,reason,delivery_state FROM query_tasks WHERE ({RELEASABLE_EXCEPTION}) OR ({DELIVERY_REVIEW}) '
             'ORDER BY created_at DESC LIMIT 20')
 
     async def get_exception(self, task):
         return await self.db.fetchone(
-            f'SELECT state,reason FROM query_tasks WHERE task_id=? AND {RELEASABLE_EXCEPTION}', (task,))
+            f'SELECT * FROM query_tasks WHERE task_id=? AND (({RELEASABLE_EXCEPTION}) OR ({DELIVERY_REVIEW}))', (task,))
+
+    async def resolve_delivery(self, task, version, *, received):
+        state = 'delivered' if received else 'not_started'
+        now = time.time()
+        async with self.db.transaction() as c:
+            async with c.execute(
+                f'UPDATE query_tasks SET delivery_state=?,delivered_at=?,updated_at=? WHERE task_id=? AND ({DELIVERY_REVIEW}) '
+                'AND updated_at=? AND (? OR delivery_cursor=0)',
+                (state, now if received else None, now, task, version, received),
+            ) as cursor:
+                return cursor.rowcount == 1
 
     async def start_hw(self, task, account):
         async with self.db.transaction() as c:
@@ -168,15 +180,17 @@ class QueryRepository:
 
     async def delivery(self, task, state, cursor=None):
         async with self.db.transaction() as c:
-            await c.execute('UPDATE query_tasks SET delivery_state=?,delivery_cursor=COALESCE(?,delivery_cursor),delivered_at=CASE WHEN ?=\'delivered\' THEN ? ELSE delivered_at END WHERE task_id=?',
-                            (state, cursor, state, time.time(), task))
+            now = time.time()
+            await c.execute('UPDATE query_tasks SET delivery_state=?,delivery_cursor=COALESCE(?,delivery_cursor),delivered_at=CASE WHEN ?=\'delivered\' THEN ? ELSE delivered_at END,updated_at=? WHERE task_id=?',
+                            (state, cursor, state, now, now, task))
 
     async def recover(self):
         """Keep intent/message IDs. Recovery NEVER submits or clicks again."""
         async with self.db.transaction() as c:
             await c.execute("UPDATE query_tasks SET state='failed',reason='restart_before_submission',reserved=0 WHERE state='prepared'")
             await c.execute("UPDATE query_tasks SET phase=state,state='pending_review',reason='restart_after_intent' WHERE state IN ('submitting','submitted','purchasing','exporting','collecting','unknown')")
-            await c.execute("UPDATE query_tasks SET delivery_state='unknown' WHERE delivery_state='sending'")
+            await c.execute("UPDATE query_tasks SET delivery_state='unknown' WHERE delivery_state='sending' "
+                            "OR (state='success' AND delivery_state='not_started' AND result_type IS NOT NULL)")
             async with c.execute("SELECT task_id,request_id,account,state,phase,delivery_state FROM query_tasks WHERE state IN ('pending_review','manual') OR delivery_state='unknown'") as cur:
                 return await cur.fetchall()
 

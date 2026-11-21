@@ -15,6 +15,19 @@ def hw_message(text='', id=11, **extras):
     return message(text, id=id, sender_id=900, **extras)
 
 
+async def test_hw_unlinked_text_does_not_deliver_or_repeat(setup_jr, manager, client, bot, monkeypatch):
+    _, queries, _, exports, _ = setup_jr
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.RESULT_WAIT', 0.03)
+    service = HWQueryService(manager.cfg, manager, Dialogue(manager.cfg), queries, exports)
+    client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
+    client.get_messages.return_value = [hw_message('查询结果\n无关联的模拟文本')]
+    report = await service.execute('1:unlinked-text', 'fixture')
+    assert report.state == QueryState.PENDING_REVIEW and report.reason == 'hw_result_unconfirmed'
+    bot.send_message.assert_not_awaited()
+    assert (await service.execute('1:unlinked-text', 'fixture')).duplicate
+    client.send_message.assert_awaited_once()
+
+
 async def test_explicit_hw_insufficient_balance_is_closed_without_export(setup_jr, manager, bot, client, monkeypatch):
     _, queries, _, exports, _ = setup_jr
     monkeypatch.setattr('telegram_bot.services.hw_query_service.RESULT_WAIT', 0.03)

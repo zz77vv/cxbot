@@ -1,6 +1,8 @@
 from .sql import one
 from ..target_bots import TARGETS
 
+SCHEMA_VERSION = 2
+
 
 class SchemaError(ValueError):
     """Safe startup diagnostic containing internal schema names only."""
@@ -23,6 +25,7 @@ async def columns(conn, table):
 
 
 async def validate_legacy(conn):
+    version = 0
     async with conn.execute("SELECT name FROM sqlite_master WHERE type='table'") as cur:
         tables = {row[0] for row in await cur.fetchall()}
     allowed = set(LEGACY_COLUMNS) | {'schema_migrations', 'checkin_state', 'checkin_attempts',
@@ -50,7 +53,7 @@ async def validate_legacy(conn):
     if 'schema_migrations' in tables:
         row = await one(conn, 'SELECT MAX(version) FROM schema_migrations')
         version = row[0] or 0
-        if version > 2:
+        if version > SCHEMA_VERSION:
             raise SchemaError('数据库版本高于当前程序，禁止降级运行')
         expected = {
             'schema_migrations': {'version'},
@@ -65,6 +68,7 @@ async def validate_legacy(conn):
         for table, required in expected.items():
             if table not in tables or {r[1] for r in await columns(conn, table)} != required:
                 raise SchemaError(f'{table} V2 结构不兼容；停止迁移')
+    return version
 
 
 async def migrate(db):

@@ -8,6 +8,9 @@ class CheckinRepository:
     async def get(self, account, bot):
         return await self.db.fetchone('SELECT * FROM checkin_state WHERE phone=? AND bot=?', (account, bot))
 
+    async def status(self):
+        return await self.db.fetchall('SELECT phone,bot,outcome FROM checkin_state WHERE last_attempt IS NOT NULL')
+
     async def initialize(self, account, bot, now, rng):
         async with self.db.transaction() as c:
             row = await one(c, 'SELECT * FROM checkin_state WHERE phone=? AND bot=?', (account, bot))

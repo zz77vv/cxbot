@@ -6,7 +6,7 @@ from ..utils.user_messages import state_text, reason_text
 def make_handler(ctx):
     @protected(ctx)
     async def handle(update, context):
-        await update.effective_message.reply_text('⏳ 手动签到中；24 小时间隔仍然有效。')
+        await update.effective_message.reply_text('⏳ 手动签到中，最多等待 4 分钟。24 小时间隔仍然有效。')
         results = await ctx.checkins.manual()
         lines = ['📋 手动签到汇总']
         for account, targets in results:

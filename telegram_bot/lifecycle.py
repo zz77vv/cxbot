@@ -39,6 +39,7 @@ class Lifecycle:
         self.stop_event = asyncio.Event()
         self.registry = TaskRegistry(self.stop_event)
         self.closed = False
+        self.close_lock = asyncio.Lock()
 
     async def run(self):
         try:
@@ -65,13 +66,17 @@ class Lifecycle:
             await self.close()
 
     async def close(self):
-        if self.closed:
-            return
-        self.closed = True
+        async with self.close_lock:
+            if self.closed:
+                return
+            await self._close_resources()
+            self.closed = True
+
+    async def _close_resources(self):
         self.ctx.jr.accepting = False
         self.ctx.requests.accepting = False
         try:
-            await self.bot.stop_polling()
+            await asyncio.wait_for(self.bot.stop_polling(), self.ctx.config.shutdown_timeout)
         except Exception as error:
             log.warning('Stop polling error_type=%s', type(error).__name__)
         active = tuple(self.ctx.jr.active | self.ctx.requests.active)

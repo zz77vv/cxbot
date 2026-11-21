@@ -7,6 +7,8 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from ...clients.userbot_manager import AccountUnavailable
 from .account_selector import AccountExclusion, NoEligibleAccountError, RateLimitEncountered
 
+ACCOUNT_WAIT_TIMEOUT = 180
+
 
 class AccountScheduler:
     def __init__(self, manager, selector, queries):
@@ -24,6 +26,15 @@ class AccountScheduler:
 
     @asynccontextmanager
     async def acquire(self, task, *, progress=None):
+        async with AsyncExitStack() as lease:
+            try:
+                async with asyncio.timeout(ACCOUNT_WAIT_TIMEOUT):
+                    account, client = await self._select(task, lease, progress)
+            except TimeoutError:
+                raise NoEligibleAccountError((AccountExclusion('', 'jr_account_wait_timeout'),)) from None
+            yield account, client
+
+    async def _select(self, task, lease, progress):
         while True:
             try:
                 ranked = await self.selector.rank()
@@ -47,8 +58,8 @@ class AccountScheduler:
                                                            time.time() + 1 if account.lock.locked() else 0))
                         continue
                     if await self.queries.reserve(task, account.key, time.time(), cooldown_seconds=60):
-                        yield account, client
-                        return
+                        lease.push_async_exit(stack.pop_all())
+                        return account, client
                     until = await self.queries.cooldown_until(account.key)
                     exclusions.append(AccountExclusion(account.key, 'account_busy_or_daily_limit',
                                                        until if until > time.time() else 0))

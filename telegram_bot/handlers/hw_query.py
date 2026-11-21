@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 def report_note(report):
     note = reason_text(report.reason)
-    if report.reason in {'hw_pending_task', 'hw_export_unconfirmed'}:
+    if report.reason in {'hw_pending_task', 'hw_export_unconfirmed', 'hw_result_unconfirmed'}:
         note += '\n请在 /jrtasks 中核实或解除。'
     if report.task_id and report.reason != 'query_completed':
         note += f'\n任务：{report.task_id}'

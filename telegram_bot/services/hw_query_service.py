@@ -106,16 +106,24 @@ class HWQueryService:
             if sender is None:
                 return await self._hold(task, 'unrecognized_target_reply')
 
+            unconfirmed_text = False
+
             def candidate(message):
+                nonlocal unconfirmed_text
                 headline = (getattr(message, 'text', '') or '').lstrip().partition('\n')[0]
-                return (not any(marker in headline for marker in STATUS_MARKERS)
-                        and reply_matches(message, sender, {sent.id})
-                        and (export_button(message) is not None or bool(result_text(message))
-                             or insufficient_balance(message)))
+                if any(marker in headline for marker in STATUS_MARKERS) or not reply_matches(message, sender, {sent.id}):
+                    return False
+                if export_button(message) is not None or insufficient_balance(message):
+                    return True
+                if result_text(message):
+                    if linked_reply(message, sender, {sent.id}):
+                        return True
+                    unconfirmed_text = True
+                return False
 
             result = await self.dialogue.wait(client, HW.bot, sent.id, candidate, RESULT_WAIT)
             if not result:
-                return await self._hold(task, reason)
+                return await self._hold(task, 'hw_result_unconfirmed' if unconfirmed_text else reason)
             button = export_button(result)
             if button is None and not result_text(result) and insufficient_balance(result):
                 reason = 'hw_insufficient_balance'
