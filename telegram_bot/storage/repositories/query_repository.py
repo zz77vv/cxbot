@@ -47,6 +47,10 @@ class QueryRepository:
             f'SELECT task_id,state,reason FROM query_tasks WHERE {RELEASABLE_EXCEPTION} '
             'ORDER BY created_at DESC LIMIT 20')
 
+    async def get_exception(self, task):
+        return await self.db.fetchone(
+            f'SELECT state,reason FROM query_tasks WHERE task_id=? AND {RELEASABLE_EXCEPTION}', (task,))
+
     async def release_exception(self, task):
         async with self.db.transaction() as c:
             async with c.execute(

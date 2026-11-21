@@ -32,6 +32,7 @@ def register(application, ctx):
                  'qd': checkin.make_handler(ctx), 'jf': balance.make_handler(ctx),
                  'status': state, 'login': login.start_handler(ctx), 'cancel': login.cancel_handler(ctx)}
     application.add_handler(MessageHandler(filters.ALL, admin_guard(ctx)), group=-1)
+    application.add_handler(CallbackQueryHandler(jr_tasks.make_callback(ctx), pattern=jr_tasks.CALLBACK_PATTERN))
     manual = getattr(ctx.jr, 'manual_verification', None)
     if manual is not None:
         application.add_handler(CallbackQueryHandler(manual.callback, pattern=r'^jrverify:[\w-]{22}:[0-9]+$'))
