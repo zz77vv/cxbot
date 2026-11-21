@@ -17,6 +17,7 @@ REASONS = {
     'cache_hit': '已使用有效缓存，无需重复查询。',
     'query_completed': '查询已完成。',
     'hw_busy': '已有盒武器查询正在处理，请等它完成。',
+    'hw_insufficient_balance': '上游明确回复余额不足，请检查盒能后再发起新查询。',
     'hw_pending_task': '上一条盒武器查询待核实，未发送新查询。',
     'hw_send_uncertain': '盒武器提交未收到确认，请核实目标记录。不会重发查询。',
     'hw_result_timeout': '等待盒武器查询结果超时。不会重发查询。',

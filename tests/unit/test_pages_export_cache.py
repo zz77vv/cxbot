@@ -121,3 +121,28 @@ async def test_export_download_failure_can_fall_back_to_existing_pages(cfg,db,cl
     result,status,reason=await exports.attempt(row['task_id'],client,original,10)
     assert result is None and status=='member' and reason=='export_download_failed'
     original.click.assert_awaited_once()
+async def test_slow_delivery_does_not_hold_cache_lock_and_second_caller_does_not_send(cfg, db, bot):
+    repo = QueryRepository(db)
+    cache = CacheService(cfg, CacheRepository(db))
+    exports = ExportService(cfg, None, repo, cache, bot)
+    row, _ = await repo.claim('slow-delivery', 'fixture', time.time())
+    result = JRQueryResult('text', '模拟结果')
+    await repo.complete(row['task_id'], result, time.time(), 300)
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def send(**kwargs):
+        started.set()
+        await finish.wait()
+
+    bot.send_message.side_effect = send
+    delivery = asyncio.create_task(exports.deliver(row['task_id'], result))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        async with asyncio.timeout(0.2):
+            async with cache.lock:
+                assert await cache.get('fixture')
+            assert await exports.deliver(row['task_id'], result) == 'sending'
+    finally:
+        finish.set()
+        await delivery
+    bot.send_message.assert_awaited_once()

@@ -15,6 +15,21 @@ def hw_message(text='', id=11, **extras):
     return message(text, id=id, sender_id=900, **extras)
 
 
+async def test_explicit_hw_insufficient_balance_is_closed_without_export(setup_jr, manager, bot, client, monkeypatch):
+    _, queries, _, exports, _ = setup_jr
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.RESULT_WAIT', 0.03)
+    service = HWQueryService(manager.cfg, manager, Dialogue(manager.cfg), queries, exports)
+    client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
+    rejected = hw_message('余额不足，请充值', reply_to_msg_id=10)
+    client.get_messages.return_value = [rejected]
+    report = await service.execute('1:reject', 'fixture')
+    assert report.state == QueryState.FAILED and report.reason == 'hw_insufficient_balance'
+    assert (await queries.get(report.task_id))['state'] == 'failed'
+    rejected.click.assert_not_awaited()
+    client.send_message.assert_awaited_once()
+    bot.send_message.assert_not_awaited()
+
+
 @pytest.mark.parametrize('mode', ['file', 'late_file', 'text', 'file_timeout', 'click_timeout', 'result_timeout'])
 async def test_hw_result_delivery_and_no_repetition(setup_jr, manager, bot, client, monkeypatch, mode):
     _, queries, _, exports, _ = setup_jr

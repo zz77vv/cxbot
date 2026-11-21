@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 RESULT_WAIT = 90
 EXPORT_WAIT = 120
 CHARGE_LINE = re.compile(r'消耗\s*[0-9]+\s*盒能')
+INSUFFICIENT_BALANCE = re.compile(r'^\s*(?:[❌⚠️💰💲]\s*)*(?:盒能|余额|积分)不足(?:[\s，。！!：:]|$)')
 STATUS_MARKERS = ('数据查询中', '快捷查询完成', '安全验证', '请先验证', '请输入验证码')
 
 
@@ -47,6 +48,10 @@ def reply_matches(message, sender, related_ids):
     reply = getattr(message, 'reply_to_msg_id', None)
     return (getattr(message, 'sender_id', None) == sender and not getattr(message, 'out', False)
             and (reply is None or reply in related_ids))
+
+
+def insufficient_balance(message):
+    return bool(INSUFFICIENT_BALANCE.match(getattr(message, 'text', '') or ''))
 
 
 class HWQueryService:
@@ -92,12 +97,17 @@ class HWQueryService:
                 headline = (getattr(message, 'text', '') or '').lstrip().partition('\n')[0]
                 return (not any(marker in headline for marker in STATUS_MARKERS)
                         and reply_matches(message, sender, {sent.id})
-                        and (export_button(message) is not None or bool(result_text(message))))
+                        and (export_button(message) is not None or bool(result_text(message))
+                             or insufficient_balance(message)))
 
             result = await self.dialogue.wait(client, HW.bot, sent.id, candidate, RESULT_WAIT)
             if not result:
                 return await self._hold(task, reason)
             button = export_button(result)
+            if button is None and not result_text(result) and insufficient_balance(result):
+                reason = 'hw_insufficient_balance'
+                await self.queries.transition(task, QueryState.FAILED, reason, source_id=result.id)
+                return QueryReport(task, QueryState.FAILED, reason)
             if button is not None:
                 reason = 'hw_export_timeout'
                 exported = await self._export(task, client, sent.id, result, button, sender)

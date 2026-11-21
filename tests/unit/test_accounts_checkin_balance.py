@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import random
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,8 +13,25 @@ from telegram_bot.services.checkin_service import CheckinService
 from telegram_bot.services.balance_service import BalanceService,parse_balance
 from telegram_bot.target_bots import TARGETS
 from telegram_bot.models.enums import Outcome,AccountState
+from telegram_bot.models.account import Account
 from telegram_bot.lifecycle import TaskRegistry
 from telethon.errors import FloodWaitError
+
+
+async def test_wait_for_busy_account_leaves_capacity_for_idle_account(cfg, client):
+    manager = UserbotManager(replace(cfg, concurrency=1), None, factory=lambda path: client)
+    busy = Account('one', cfg.sessions / 'one.session', client, AccountState.ONLINE)
+    idle = Account('two', cfg.sessions / 'two.session', client, AccountState.ONLINE)
+    async with busy.lock:
+        waiting = asyncio.create_task(manager.refresh(busy))
+        try:
+            await asyncio.sleep(0)
+            async with asyncio.timeout(0.2):
+                async with manager.operation(idle, wait=False):
+                    assert not waiting.done()
+        finally:
+            waiting.cancel()
+            await asyncio.gather(waiting, return_exceptions=True)
 
 
 async def test_sessions_load_preserves_files(cfg,db,client):

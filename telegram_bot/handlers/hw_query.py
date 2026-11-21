@@ -52,6 +52,9 @@ async def run_batch(ctx, message, request, lines):
             success += 1
         elif report.state == QueryState.FAILED:
             failed += 1
+            if report.reason == 'hw_insufficient_balance':
+                stop = f'第 {index} 条余额不足。{report_note(report)}'
+                break
         else:
             review += 1
             stop = f'第 {index} 条待核实。{report_note(report)}'

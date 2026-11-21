@@ -152,6 +152,20 @@ class QueryRepository:
         async with self.db.transaction() as c:
             await c.execute('UPDATE query_tasks SET file_path=?,file_name=? WHERE task_id=?', (path, name, task))
 
+    async def claim_delivery(self, task):
+        """Return None for the sole sender, otherwise the existing delivery state."""
+        async with self.db.transaction() as c:
+            async with c.execute(
+                "UPDATE query_tasks SET delivery_state='sending',delivery_cursor=0 "
+                "WHERE task_id=? AND delivery_state='not_started'", (task,),
+            ) as cursor:
+                if cursor.rowcount == 1:
+                    return None
+            row = await one(c, 'SELECT delivery_state FROM query_tasks WHERE task_id=?', (task,))
+            if row is None:
+                raise ValueError('delivery_task_not_found')
+            return row['delivery_state']
+
     async def delivery(self, task, state, cursor=None):
         async with self.db.transaction() as c:
             await c.execute('UPDATE query_tasks SET delivery_state=?,delivery_cursor=COALESCE(?,delivery_cursor),delivered_at=CASE WHEN ?=\'delivered\' THEN ? ELSE delivered_at END WHERE task_id=?',

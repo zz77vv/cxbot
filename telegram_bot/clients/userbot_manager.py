@@ -76,7 +76,7 @@ class UserbotManager:
         await self.repository.set_cooldown(account.key, account.unavailable_until)
 
     async def refresh(self, account, *, reconnect=False):
-        async with self.semaphore, account.lock:
+        async with account.lock, self.semaphore:
             if account.client is None:
                 account.state = AccountState.ERROR
                 return account.state
@@ -105,23 +105,23 @@ class UserbotManager:
 
     @asynccontextmanager
     async def operation(self, account, *, wait=True):
-        async with self.semaphore:
-            if not wait and account.lock.locked():
-                raise AccountUnavailable("account_busy")
-            async with account.lock:
-                if self.stopping or account.unavailable_until > time.time() or account.state != AccountState.ONLINE:
-                    raise AccountUnavailable('account_unavailable')
-                if not account.client.is_connected():
-                    account.state = AccountState.OFFLINE
-                    raise AccountUnavailable('account_disconnected')
-                try:
-                    yield account.client
-                except FloodWaitError as error:
-                    await self.flood_wait(account, error.seconds)
-                    raise
-                except (ConnectionError, OSError):
-                    account.state = AccountState.ERROR
-                    raise
+        if not wait and account.lock.locked():
+            raise AccountUnavailable("account_busy")
+        # Waiting for one account must not take capacity away from idle accounts.
+        async with account.lock, self.semaphore:
+            if self.stopping or account.unavailable_until > time.time() or account.state != AccountState.ONLINE:
+                raise AccountUnavailable('account_unavailable')
+            if not account.client.is_connected():
+                account.state = AccountState.OFFLINE
+                raise AccountUnavailable('account_disconnected')
+            try:
+                yield account.client
+            except FloodWaitError as error:
+                await self.flood_wait(account, error.seconds)
+                raise
+            except (ConnectionError, OSError):
+                account.state = AccountState.ERROR
+                raise
 
     async def monitor(self):
         while not self.stopping:
