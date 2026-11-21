@@ -22,6 +22,7 @@ REASONS = {
     'hw_send_uncertain': '盒武器提交未收到确认，请核实目标记录。不会重发查询。',
     'hw_result_timeout': '等待盒武器查询结果超时。不会重发查询。',
     'hw_export_timeout': '未能确认盒武器的导出文件，请核实目标记录。不会重发查询或重复点击导出。',
+    'hw_export_unconfirmed': '收到文件，但无法确认属于本次查询，已留待核实。不会重发查询或重复点击导出。',
     'existing_task_no_resubmission': '已存在相同任务，没有重复提交。',
     'no_available_balance': '没有符合条件的账号，可能被未结案任务或额度限制阻止，并非一定积分不足。',
     'no_eligible_account': '暂时没有符合接单条件的账号，请检查账号状态、未结案任务和额度。',

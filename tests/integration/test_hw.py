@@ -36,7 +36,7 @@ async def test_hw_result_delivery_and_no_repetition(setup_jr, manager, bot, clie
     monkeypatch.setattr('telegram_bot.services.hw_query_service.RESULT_WAIT', 0.03)
     monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 0.03)
     service = HWQueryService(manager.cfg, manager, Dialogue(manager.cfg), queries, exports)
-    result = hw_message('查询结果\n脱敏测试记录\n消耗 105 盒能', 12)
+    result = hw_message('查询结果\n脱敏测试记录\n消耗 105 盒能', 12, reply_to_msg_id=10)
     if mode not in ('text', 'result_timeout'):
         result.buttons = [[KeyboardButtonCallback('📥 导出', b'export'),
                            KeyboardButtonCallback('AI分析(20点)', b'ai')]]
@@ -129,6 +129,56 @@ async def test_hw_handler_only_accepts_admin_private_and_preserves_content(cfg):
     chat.type = 'private'
     await handle(update, None)
     execute.assert_awaited_once_with(f'{cfg.admin_id}:2', '查询  内容')
+
+
+@pytest.mark.parametrize('case', ['unlinked', 'other_task', 'unlinked_parent', 'cross_chat',
+                                  'direct', 'valid_after_unlinked'])
+async def test_hw_export_requires_same_chat_reply_chain(setup_jr, manager, bot, client, monkeypatch, case):
+    from pathlib import Path
+
+    _, queries, _, exports, _ = setup_jr
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 0.03)
+    cfg = manager.cfg
+    service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
+    client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
+    upstream_result = hw_message('查询结果\n模拟文本', 12,
+                                 reply_to_msg_id=None if case in ('unlinked_parent', 'direct') else 10,
+                                 buttons=[[KeyboardButtonCallback('导出', b'export')]])
+    reply = {'unlinked': None, 'other_task': 8, 'direct': 10, 'valid_after_unlinked': None}.get(case, 12)
+    candidate = hw_message('已导出为文件', 13, reply_to_msg_id=reply, document=True,
+                           file=SimpleNamespace(name='待验证.txt'))
+    if case == 'cross_chat':
+        candidate.reply_to = SimpleNamespace(reply_to_peer_id=SimpleNamespace(user_id=999))
+    verified_file = hw_message('已导出为文件', 14, reply_to_msg_id=12, document=True,
+                               file=SimpleNamespace(name='已验证.txt'))
+
+    def history(target, **options):
+        rows = [upstream_result]
+        if upstream_result.click.await_count:
+            rows.insert(0, candidate)
+            if case == 'valid_after_unlinked':
+                rows.insert(0, verified_file)
+        return rows[:options['limit']]
+
+    async def download(msg, file):
+        assert msg is (verified_file if case == 'valid_after_unlinked' else candidate)
+        Path(file).write_bytes(b'fixture')
+        return file
+
+    client.get_messages.side_effect = history
+    client.download_media.side_effect = download
+    report = await service.execute('1:correlate', 'fixture')
+    if case in ('direct', 'valid_after_unlinked'):
+        assert report.state == QueryState.SUCCESS
+        bot.send_document.assert_awaited_once()
+    else:
+        assert report.state == QueryState.PENDING_REVIEW and report.reason == 'hw_export_unconfirmed'
+        assert (await queries.get(report.task_id))['delivery_state'] == 'not_started'
+        bot.send_document.assert_not_awaited()
+        client.download_media.assert_not_awaited()
+    assert (await service.execute('1:correlate', 'fixture')).duplicate
+    client.send_message.assert_awaited_once()
+    upstream_result.click.assert_awaited_once_with(0, 0)
 
 
 @pytest.mark.parametrize('stop_reason', ['', 'hw_export_timeout', 'existing_task_no_resubmission'])

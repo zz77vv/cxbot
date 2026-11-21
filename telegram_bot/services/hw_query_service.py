@@ -44,10 +44,23 @@ def result_text(message):
     return ''
 
 
+def from_sender(message, sender):
+    return getattr(message, 'sender_id', None) == sender and not getattr(message, 'out', False)
+
+
 def reply_matches(message, sender, related_ids):
     reply = getattr(message, 'reply_to_msg_id', None)
-    return (getattr(message, 'sender_id', None) == sender and not getattr(message, 'out', False)
-            and (reply is None or reply in related_ids))
+    return from_sender(message, sender) and (reply is None or reply in related_ids)
+
+
+def linked_reply(message, sender, related_ids):
+    header = getattr(message, 'reply_to', None)
+    peer = getattr(header, 'reply_to_peer_id', None)
+    reply = getattr(message, 'reply_to_msg_id', None)
+    if reply is None:
+        reply = getattr(header, 'reply_to_msg_id', None)
+    return (from_sender(message, sender) and reply in related_ids
+            and (peer is None or getattr(peer, 'user_id', None) == sender))
 
 
 def insufficient_balance(message):
@@ -110,9 +123,9 @@ class HWQueryService:
                 return QueryReport(task, QueryState.FAILED, reason)
             if button is not None:
                 reason = 'hw_export_timeout'
-                exported = await self._export(task, client, sent.id, result, button, sender)
+                exported, unconfirmed = await self._export(task, client, sent.id, result, button, sender)
                 if not exported:
-                    return await self._hold(task, reason)
+                    return await self._hold(task, 'hw_export_unconfirmed' if unconfirmed else reason)
                 reason = 'document_download_failed'
                 outcome = await self.exports.download(task, client, exported)
             else:
@@ -147,14 +160,24 @@ class HWQueryService:
             # The callback may already have arrived upstream. Only read for the file.
             pass
 
-        def is_file(message):
-            name = getattr(getattr(message, 'file', None), 'name', '') or ''
-            return (reply_matches(message, sender, {sent_id, result.id})
-                    and getattr(message, 'document', None) and name.lower().endswith('.txt')
-                    and (getattr(message, 'reply_to_msg_id', None) is not None
-                         or '已导出为文件' in (getattr(message, 'text', '') or '')))
+        related_ids = {sent_id}
+        if linked_reply(result, sender, related_ids):
+            related_ids.add(result.id)
+        unconfirmed = False
 
-        return await self.dialogue.wait(client, HW.bot, baseline, is_file, EXPORT_WAIT)
+        def is_file(message):
+            nonlocal unconfirmed
+            name = getattr(getattr(message, 'file', None), 'name', '') or ''
+            if not (from_sender(message, sender) and getattr(message, 'document', None)
+                    and name.lower().endswith('.txt')):
+                return False
+            if linked_reply(message, sender, related_ids):
+                return True
+            unconfirmed = True
+            return False
+
+        file = await self.dialogue.wait(client, HW.bot, baseline, is_file, EXPORT_WAIT)
+        return file, unconfirmed
 
     async def _hold(self, task, reason):
         await self.queries.transition(task, QueryState.PENDING_REVIEW, reason)
