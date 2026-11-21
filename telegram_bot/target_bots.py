@@ -28,6 +28,7 @@ TARGETS = (
     TargetBot('核武器', '@hewuqi', '/qd', '个人', r'盒能\s*[:：]\s*`?(\d+)`?', balance_timeout=60),
 )
 JR = TARGETS[1]
+HW = TARGETS[2]
 MIN_INTERVAL = 86400
 RANDOM_OFFSET_MAX = 900
 JR_MAX_PAGES = 200

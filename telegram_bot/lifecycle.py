@@ -50,7 +50,8 @@ class Lifecycle:
                 # Manual tasks already receive a notification when they enter that state.
                 if row['state'] == 'manual' and row['delivery_state'] != 'unknown':
                     continue
-                await self.ctx.jr.exports.notify(row['task_id'], row['state'], 'restart_requires_review')
+                label = 'HWQ 查询' if row['request_id'].startswith('hw:') else '巨人查询'
+                await self.ctx.jr.exports.notify(row['task_id'], row['state'], 'restart_requires_review', label=label)
             await self.ctx.cache.cleanup()
             self.ctx.checkins.start(self.registry)
             self.registry.start(self.ctx.logins.loop(), 'login-expiry')

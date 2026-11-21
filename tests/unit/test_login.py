@@ -181,7 +181,7 @@ def test_current_targets_and_menu():
     from telegram_bot.target_bots import TARGETS
     from telegram_bot.handlers.registration import COMMANDS
     assert {t.bot for t in TARGETS}=={'@zhonghybot','@jrsgk','@hewuqi'}
-    assert set(COMMANDS)=={'start','help','jr','jrtasks','qd','jf','status','login','cancel'}
+    assert set(COMMANDS)=={'start','help','jr','hw','jrtasks','qd','jf','status','login','cancel'}
 
 
 async def test_login_dc_routing_retry_is_bounded(login,cfg):

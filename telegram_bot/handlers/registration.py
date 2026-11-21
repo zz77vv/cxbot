@@ -5,7 +5,7 @@ from telegram import (BotCommand, BotCommandScopeDefault, BotCommandScopeChat,
 from telegram.ext import CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from telegram.error import NetworkError, BadRequest
 from .menu_sync import missing_private_chat, set_admin_menu
-from . import start_help, checkin, balance, jr_query, jr_tasks, status, login
+from . import start_help, checkin, balance, jr_query, jr_tasks, hw_query, status, login
 from .guards import admin_guard
 from ..utils.retry import retry_safe
 
@@ -13,6 +13,7 @@ COMMANDS = {
     'start': '显示当前身份对应的功能菜单',
     'help': '显示当前身份对应的帮助',
     'jr': '巨人查询，每行一条可批量（也支持 /jr+内容）',
+    'hw': '私聊查询 HWQ 并接收导出文件或结果',
     'jrtasks': '查看和解除异常查询任务',
     'qd': '手动触发所有账号签到',
     'jf': '查询所有账号签到积分',
@@ -26,6 +27,7 @@ def register(application, ctx):
     menu = start_help.make_handler(ctx, COMMANDS)
     state = status.make_handler(ctx)
     callbacks = {'start': menu, 'help': menu, 'jr': jr_query.make_handler(ctx),
+                 'hw': hw_query.make_handler(ctx),
                  'jrtasks': jr_tasks.make_handler(ctx),
                  'qd': checkin.make_handler(ctx), 'jf': balance.make_handler(ctx),
                  'status': state, 'login': login.start_handler(ctx), 'cancel': login.cancel_handler(ctx)}

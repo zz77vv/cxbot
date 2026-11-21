@@ -20,6 +20,7 @@ from .storage.repositories.cache_repository import CacheRepository
 from .storage.repositories.membership_repository import MembershipRepository
 from .storage.repositories.user_repository import UserRepository
 from .services.login_service import LoginService
+from .services.hw_query_service import HWQueryService
 from .services.checkin_service import CheckinService
 from .services.balance_service import BalanceService
 from .services.account_status_service import AccountStatusService
@@ -64,7 +65,8 @@ async def run(cfg):
         checkins = CheckinService(manager, CheckinRepository(db), dialogue)
         logins = LoginService(cfg, manager, lambda: checkins.start(lifecycle.registry))
         ctx = AppContext(cfg, db, manager, checkins,
-                         balances, AccountStatusService(manager), jr, ocr, cache, UserRepository(db), RequestTracker(), logins)
+                         balances, AccountStatusService(manager), jr, ocr, cache, UserRepository(db), RequestTracker(),
+                         logins, HWQueryService(cfg, manager, dialogue, queries, exports))
         lifecycle = Lifecycle(ctx, BotApplication(application, cfg), queries)
         register(application, ctx)
         loop = asyncio.get_running_loop()

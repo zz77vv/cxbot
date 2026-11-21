@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from .services.hw_query_service import HWQueryService
 from .services.login_service import LoginService
 from .config import Config
 from .clients.userbot_manager import UserbotManager
@@ -27,3 +28,4 @@ class AppContext:
     users: UserRepository
     requests: RequestTracker
     logins: LoginService
+    hw: HWQueryService

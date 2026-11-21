@@ -107,7 +107,7 @@ class ExportService:
                 return None, 'member', 'export_download_failed'
         return None, 'member' if success_seen else 'unknown', 'export_file_timeout'
 
-    async def deliver(self, task, result, *, progress=None):
+    async def deliver(self, task, result, *, progress=None, raw_text=False):
         """Record intent before every send; ambiguous delivery never auto-retries."""
         row = await self.queries.get(task)
         if row['delivery_state'] != 'not_started':
@@ -123,7 +123,7 @@ class ExportService:
                         progress.file_sent = True
                     await self.queries.delivery(task, 'delivered', 1)
                 else:
-                    cleaned = normalize_jr_full_result(result.text)
+                    cleaned = result.text if raw_text else normalize_jr_full_result(result.text)
                     if not cleaned:
                         raise ValueError('empty_result')
                     if progress is not None:
@@ -132,8 +132,11 @@ class ExportService:
                     else:
                         pieces = split_text_by_lines(cleaned, limit=3600)
                         for index, piece in enumerate(pieces):
-                            title = '✅ 巨人查询完成' if index == 0 else f'—— 续 {index + 1}/{len(pieces)} ——'
-                            await self.bot.send_message(chat_id=self.cfg.admin_id, text=f'{title}\n\n{piece}')
+                            if raw_text:
+                                await self.bot.send_message(chat_id=self.cfg.admin_id, text=piece, parse_mode=None)
+                            else:
+                                title = '✅ 巨人查询完成' if index == 0 else f'—— 续 {index + 1}/{len(pieces)} ——'
+                                await self.bot.send_message(chat_id=self.cfg.admin_id, text=f'{title}\n\n{piece}')
                             await self.queries.delivery(task, 'sending', index + 1)
                         await self.queries.delivery(task, 'delivered', len(pieces))
             except BaseException:
@@ -144,9 +147,9 @@ class ExportService:
             await progress.delete_after_file()
         return 'delivered'
 
-    async def notify(self, task, state, reason):
+    async def notify(self, task, state, reason, *, label='巨人查询'):
         try:
             await self.bot.send_message(chat_id=self.cfg.admin_id,
-                text=f'⚠️ 巨人查询任务 {task}\n状态：{state_text(state)}\n原因：{reason_text(reason)}\n请核实目标机器人记录；系统不会自动重做。')
+                text=f'⚠️ {label}任务 {task}\n状态：{state_text(state)}\n原因：{reason_text(reason)}\n请核实目标机器人记录；系统不会自动重做。')
         except Exception as error:
             log.error('Admin notification failed task=%s error_type=%s', task, type(error).__name__)

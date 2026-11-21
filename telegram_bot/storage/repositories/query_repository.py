@@ -51,6 +51,16 @@ class QueryRepository:
         return await self.db.fetchone(
             f'SELECT state,reason FROM query_tasks WHERE task_id=? AND {RELEASABLE_EXCEPTION}', (task,))
 
+    async def start_hw(self, task, account):
+        async with self.db.transaction() as c:
+            blocker = await one(c, f"SELECT task_id FROM query_tasks WHERE request_id LIKE 'hw:%' "
+                                f"AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1", (task, *UNRESOLVED))
+            if blocker:
+                return blocker['task_id']
+            await c.execute("UPDATE query_tasks SET account=?,state='submitting',phase='submitting',updated_at=? "
+                            "WHERE task_id=?", (account, time.time(), task))
+            return None
+
     async def release_exception(self, task):
         async with self.db.transaction() as c:
             async with c.execute(
@@ -61,7 +71,7 @@ class QueryRepository:
                 return cursor.rowcount == 1
 
     async def unresolved_account(self, account, excluding=''):
-        return await self.db.fetchone(f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
+        return await self.db.fetchone(f"SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND request_id NOT LIKE 'hw:%' AND state IN ({PLACEHOLDERS}) LIMIT 1",
                                      (account, excluding, *UNRESOLVED)) is not None
 
     async def cooldown_until(self, account):
@@ -91,7 +101,7 @@ class QueryRepository:
             cooldown = await one(c, 'SELECT until_at FROM jr_query_cooldowns WHERE phone=?', (account,))
             if cooldown and cooldown[0] > now:
                 return False
-            blocked = await one(c, f'SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND state IN ({PLACEHOLDERS}) LIMIT 1',
+            blocked = await one(c, f"SELECT task_id FROM query_tasks WHERE account=? AND task_id<>? AND request_id NOT LIKE 'hw:%' AND state IN ({PLACEHOLDERS}) LIMIT 1",
                                 (account, task, *UNRESOLVED))
             if blocked:
                 return False
@@ -112,7 +122,7 @@ class QueryRepository:
             await c.execute('UPDATE query_tasks SET state=?,phase=?,reason=?,updated_at=?,sent_id=COALESCE(?,sent_id),source_id=COALESCE(?,source_id),reserved=CASE WHEN ?=\'failed\' THEN 0 ELSE reserved END WHERE task_id=?',
                             (state.value, state.value, reason, time.time(), sent_id, source_id, state.value, task))
 
-    async def complete(self, task, result, now, ttl, *, from_cache=False):
+    async def complete(self, task, result, now, ttl, *, from_cache=False, cache_result=True):
         async with self.db.transaction() as c:
             row = await one(c, 'SELECT * FROM query_tasks WHERE task_id=?', (task,))
             if row['state'] == 'success':
@@ -126,7 +136,7 @@ class QueryRepository:
                         await c.execute('DELETE FROM jr_query_cooldowns WHERE phone=?', (account,))
             await c.execute("UPDATE query_tasks SET state='success',phase='complete',reason='',reserved=0,result_type=?,result_text=?,file_path=?,file_name=?,export_status=?,updated_at=? WHERE task_id=?",
                             (result.kind, result.text, result.file_path, result.file_name, result.export_status, now, task))
-            if not from_cache:
+            if not from_cache and cache_result:
                 await c.execute('INSERT INTO jr_result_cache(cache_key,result_text,source_phone,created_at,expires_at,result_type,file_path,file_name) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(cache_key) DO UPDATE SET result_text=excluded.result_text,source_phone=excluded.source_phone,created_at=excluded.created_at,expires_at=excluded.expires_at,result_type=excluded.result_type,file_path=excluded.file_path,file_name=excluded.file_name',
                                 (row['cache_key'], result.text, account, now, now + ttl, result.kind, result.file_path, result.file_name))
 
@@ -153,7 +163,7 @@ class QueryRepository:
             await c.execute("UPDATE query_tasks SET state='failed',reason='restart_before_submission',reserved=0 WHERE state='prepared'")
             await c.execute("UPDATE query_tasks SET phase=state,state='pending_review',reason='restart_after_intent' WHERE state IN ('submitting','submitted','purchasing','exporting','collecting','unknown')")
             await c.execute("UPDATE query_tasks SET delivery_state='unknown' WHERE delivery_state='sending'")
-            async with c.execute("SELECT task_id,account,state,phase,delivery_state FROM query_tasks WHERE state IN ('pending_review','manual') OR delivery_state='unknown'") as cur:
+            async with c.execute("SELECT task_id,request_id,account,state,phase,delivery_state FROM query_tasks WHERE state IN ('pending_review','manual') OR delivery_state='unknown'") as cur:
                 return await cur.fetchall()
 
     async def review(self, task, decision, reason):
