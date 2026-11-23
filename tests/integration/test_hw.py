@@ -30,7 +30,7 @@ async def test_hw_standalone_txt_waits_for_exact_admin_choice(setup_jr, manager,
     jr, queries, _, exports, _ = setup_jr
     cfg = manager.cfg
     monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 3)
-    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_LINK_GRACE', 0.03)
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_SETTLE_WAIT', 0.03)
     service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
     client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
     upstream = hw_message('查询结果\n测试', 12, buttons=[[KeyboardButtonCallback('导出', b'export')]])
@@ -57,6 +57,10 @@ async def test_hw_standalone_txt_waits_for_exact_admin_choice(setup_jr, manager,
         await queries.start_hw(task, next(iter(manager.accounts)))
         await queries.transition(task, QueryState.PENDING_REVIEW, 'hw_export_unconfirmed', sent_id=10, source_id=12)
     else:
+        older, _ = await queries.claim('hw:previous', 'hw:previous', time.time() - 60)
+        await queries.start_hw(older['task_id'], next(iter(manager.accounts)))
+        await queries.transition(older['task_id'], QueryState.PENDING_REVIEW, 'hw_export_timeout', source_id=8)
+        assert await queries.release_exception(older['task_id'])
         report = await asyncio.wait_for(service.execute('fixture', 'sample'), 1)
         assert report.reason == 'hw_export_unconfirmed'
         task = report.task_id
@@ -225,12 +229,23 @@ async def test_hw_handler_only_accepts_admin_private_and_preserves_content(cfg):
     execute.assert_awaited_once_with(f'{cfg.admin_id}:2', '查询  内容')
 
 
-@pytest.mark.parametrize('case', ['unlinked', 'other_task', 'unlinked_parent', 'cross_chat',
-                                  'direct', 'valid_after_unlinked'])
-async def test_hw_export_requires_same_chat_reply_chain(setup_jr, manager, bot, client, monkeypatch, case):
+@pytest.mark.parametrize('case', ['unlinked', 'unlinked_parent', 'direct', 'clean_account', 'pre_click',
+                                  'other_task', 'cross_chat', 'multiple', 'valid_after_unlinked', 'unrelated_after'])
+async def test_hw_export_uses_unique_new_txt(setup_jr, manager, bot, client, monkeypatch, case):
     from pathlib import Path
+    import time
+
+    from telegram_bot.models.account import Account
+    from telegram_bot.models.enums import AccountState
+    from telegram_bot.services.hw_query_service import export_candidates
 
     _, queries, _, exports, _ = setup_jr
+    if case == 'clean_account':
+        old, _ = await queries.claim('hw:previous', 'hw:previous', time.time() - 60)
+        await queries.start_hw(old['task_id'], next(iter(manager.accounts)))
+        await queries.transition(old['task_id'], QueryState.PENDING_REVIEW, 'hw_export_timeout', source_id=8)
+        assert await queries.release_exception(old['task_id'])
+        manager.accounts['10002'] = Account('10002', manager.cfg.sessions / '10002.session', client, AccountState.ONLINE)
     monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 0.03)
     cfg = manager.cfg
     service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
@@ -238,36 +253,43 @@ async def test_hw_export_requires_same_chat_reply_chain(setup_jr, manager, bot, 
     upstream_result = hw_message('查询结果\n模拟文本', 12,
                                  reply_to_msg_id=None if case in ('unlinked_parent', 'direct') else 10,
                                  buttons=[[KeyboardButtonCallback('导出', b'export')]])
-    reply = {'unlinked': None, 'other_task': 8, 'direct': 10, 'valid_after_unlinked': None}.get(case, 12)
+    replies = {'other_task': 8, 'direct': 10, 'unlinked_parent': 12, 'cross_chat': 12}
+    reply = replies.get(case)
     candidate = hw_message('已导出为文件', 13, reply_to_msg_id=reply, document=SimpleNamespace(id=99),
                            file=SimpleNamespace(name='待验证.txt'))
     if case == 'cross_chat':
         candidate.reply_to = SimpleNamespace(reply_to_peer_id=SimpleNamespace(user_id=999))
-    verified_file = hw_message('已导出为文件', 14, reply_to_msg_id=12, document=True,
+    second_reply = {'valid_after_unlinked': 12, 'unrelated_after': 8}.get(case)
+    second_file = hw_message('已导出为文件', 14, reply_to_msg_id=second_reply, document=SimpleNamespace(id=100),
                                file=SimpleNamespace(name='已验证.txt'))
 
     def history(target, **options):
         rows = [upstream_result]
-        if upstream_result.click.await_count:
+        if case == 'pre_click' or upstream_result.click.await_count:
             rows.insert(0, candidate)
-            if case == 'valid_after_unlinked':
-                rows.insert(0, verified_file)
+            if case in ('multiple', 'valid_after_unlinked', 'unrelated_after'):
+                rows.insert(0, second_file)
         return rows[:options['limit']]
 
     async def download(msg, file):
-        assert msg is (verified_file if case == 'valid_after_unlinked' else candidate)
+        assert msg is candidate
         Path(file).write_bytes(b'fixture')
         return file
 
     client.get_messages.side_effect = history
     client.download_media.side_effect = download
     report = await service.execute('1:correlate', 'fixture')
-    if case in ('direct', 'valid_after_unlinked'):
+    if case in ('unlinked', 'unlinked_parent', 'direct', 'clean_account'):
         assert report.state == QueryState.SUCCESS
         bot.send_document.assert_awaited_once()
+        if case == 'clean_account':
+            assert (await queries.get(report.task_id))['account'] == '10002'
     else:
-        assert report.state == QueryState.PENDING_REVIEW and report.reason == 'hw_export_unconfirmed'
+        reason = 'hw_export_timeout' if case == 'pre_click' else 'hw_export_unconfirmed'
+        assert report.state == QueryState.PENDING_REVIEW and report.reason == reason
         assert (await queries.get(report.task_id))['delivery_state'] == 'not_started'
+        if case in ('multiple', 'valid_after_unlinked'):
+            assert [item['id'] for item in export_candidates(await queries.get_exception(report.task_id))] == [13, 14]
         bot.send_document.assert_not_awaited()
         client.download_media.assert_not_awaited()
     assert (await service.execute('1:correlate', 'fixture')).duplicate

@@ -16,7 +16,7 @@ from .jr.cache_service import jr_cache_key
 log = logging.getLogger(__name__)
 RESULT_WAIT = 90
 EXPORT_WAIT = 120
-EXPORT_LINK_GRACE = 3
+EXPORT_SETTLE_WAIT = 3
 CHARGE_LINE = re.compile(r'消耗\s*[0-9]+\s*盒能')
 INSUFFICIENT_BALANCE = re.compile(r'^\s*(?:[❌⚠️💰💲]\s*)*(?:盒能|余额|积分)不足(?:[\s，。！!：:]|$)')
 STATUS_MARKERS = ('数据查询中', '快捷查询完成', '安全验证', '请先验证', '请输入验证码')
@@ -117,7 +117,9 @@ class HWQueryService:
             task = row['task_id']
             if not fresh:
                 return QueryReport(task, QueryState(row['state']), 'existing_task_no_resubmission', duplicate=True)
-            for account in tuple(self.accounts.accounts.values()):
+            unverified_accounts = await self.queries.hw_accounts_with_unverified_exports()
+            accounts = sorted(self.accounts.accounts.values(), key=lambda account: account.key in unverified_accounts)
+            for account in accounts:
                 if account.state != AccountState.ONLINE or account.lock.locked():
                     continue
                 try:
@@ -126,13 +128,14 @@ class HWQueryService:
                         if blocker:
                             await self.queries.transition(task, QueryState.FAILED, 'hw_pending_task')
                             return QueryReport(blocker, QueryState.PENDING_REVIEW, 'hw_pending_task')
-                        return await self._query(task, account, client, text)
+                        return await self._query(task, account, client, text,
+                                                 allow_standalone=account.key not in unverified_accounts)
                 except AccountUnavailable:
                     continue
             await self.queries.transition(task, QueryState.FAILED, 'account_unavailable_before_submission')
             return QueryReport(task, QueryState.FAILED, 'account_unavailable_before_submission')
 
-    async def _query(self, task, account, client, text):
+    async def _query(self, task, account, client, text, *, allow_standalone):
         reason = 'hw_send_uncertain'
         try:
             sent = await asyncio.wait_for(client.send_message(HW.bot, text), self.cfg.reply_timeout)
@@ -167,7 +170,9 @@ class HWQueryService:
                 return QueryReport(task, QueryState.FAILED, reason)
             if button is not None:
                 reason = 'hw_export_timeout'
-                exported, unconfirmed, candidates = await self._export(task, client, sent.id, result, button, sender)
+                exported, unconfirmed, candidates = await self._export(
+                    task, client, sent.id, result, button, sender, allow_standalone=allow_standalone,
+                )
                 if not exported:
                     report = await self._hold(task, 'hw_export_unconfirmed' if unconfirmed else reason)
                     if candidates:
@@ -197,10 +202,10 @@ class HWQueryService:
             return QueryReport(task, QueryState.SUCCESS, 'delivery_requires_review')
         return QueryReport(task, QueryState.SUCCESS, 'query_completed', outcome)
 
-    async def _export(self, task, client, sent_id, result, button, sender):
+    async def _export(self, task, client, sent_id, result, button, sender, *, allow_standalone):
+        await self.queries.transition(task, QueryState.EXPORTING, source_id=result.id)
         history = await self.dialogue.messages(client, HW.bot, limit=1)
         baseline = max([result.id, *(message.id for message in history)])
-        await self.queries.transition(task, QueryState.EXPORTING, source_id=result.id)
         try:
             await asyncio.wait_for(result.click(*button), self.cfg.reply_timeout)
         except TimeoutError:
@@ -210,38 +215,47 @@ class HWQueryService:
         related_ids = {sent_id}
         if linked_reply(result, sender, related_ids):
             related_ids.add(result.id)
-        unconfirmed = False
-        candidates = {}
+        saw_txt = False
+        saw_unrelated_txt = False
+        files = {}
 
-        def is_file(message, *, accept_candidate=False):
-            nonlocal unconfirmed
+        def remember_file(message):
+            nonlocal saw_txt, saw_unrelated_txt
             name = getattr(getattr(message, 'file', None), 'name', '') or ''
             if not (from_sender(message, sender) and getattr(message, 'document', None)
                     and name.lower().endswith('.txt')):
                 return False
-            if linked_reply(message, sender, related_ids):
-                return True
-            unconfirmed = True
-            if len(candidates) < 5 and reply_matches(message, sender, {sent_id, result.id}):
-                metadata = candidate_metadata(message)
-                if metadata:
-                    candidates[message.id] = metadata
-                    return accept_candidate
-            return False
+            saw_txt = True
+            if not reply_matches(message, sender, {sent_id, result.id}):
+                saw_unrelated_txt = True
+                return False
+            files[message.id] = candidate_metadata(message)
+            return True
+
+        rechecked = False
+
+        def find_second_file(message):
+            nonlocal rechecked
+            if remember_file(message):
+                rechecked = True
+            return len(files) > 1
 
         deadline = time.monotonic() + EXPORT_WAIT
-        file = await self.dialogue.wait(
-            client, HW.bot, baseline,
-            lambda message: is_file(message, accept_candidate=True), EXPORT_WAIT,
-        )
-        if file and not linked_reply(file, sender, related_ids):
-            grace = min(EXPORT_LINK_GRACE, max(0, deadline - time.monotonic()))
+        file = await self.dialogue.wait(client, HW.bot, baseline, remember_file, EXPORT_WAIT)
+        if file:
+            grace = min(EXPORT_SETTLE_WAIT, max(0, deadline - time.monotonic()))
             try:
-                file = await self.dialogue.wait(client, HW.bot, baseline, is_file, grace) if grace else None
+                if grace:
+                    await self.dialogue.wait(client, HW.bot, baseline, find_second_file, grace)
             except OSError:
-                # The candidate is already known. Preserve it if the extra read fails.
-                file = None
-        return file, unconfirmed, list(candidates.values())
+                # Keep the file available for manual review if we could not finish checking.
+                pass
+            else:
+                linked = linked_reply(file, sender, related_ids)
+                standalone = allow_standalone and rechecked and not saw_unrelated_txt and files[file.id] is not None
+                if len(files) == 1 and (linked or standalone):
+                    return file, False, []
+        return None, saw_txt, [metadata for metadata in files.values() if metadata is not None]
 
     async def find_export_candidates(self, row):
         """Administrator-initiated read of the existing upstream conversation."""

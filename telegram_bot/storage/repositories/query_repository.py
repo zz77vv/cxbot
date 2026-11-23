@@ -93,6 +93,14 @@ class QueryRepository:
                             "WHERE task_id=?", (account, time.time(), task))
             return None
 
+    async def hw_accounts_with_unverified_exports(self):
+        rows = await self.db.fetchall(
+            f"SELECT DISTINCT account FROM query_tasks WHERE request_id LIKE 'hw:%' AND source_id IS NOT NULL "
+            f"AND (state IN ({PLACEHOLDERS}) OR (state='failed' AND reason GLOB 'operator_closed_unverified:*'))",
+            UNRESOLVED,
+        )
+        return {row['account'] for row in rows}
+
     async def release_exception(self, task):
         async with self.db.transaction() as c:
             async with c.execute(
