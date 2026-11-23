@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 from ..sql import one
@@ -9,6 +10,8 @@ from ...models.query import JRQueryResult
 PLACEHOLDERS = ','.join('?' for _ in UNRESOLVED)
 RELEASABLE_EXCEPTION = "state IN ('pending_review','manual','unknown') AND delivery_state!='sending'"
 DELIVERY_REVIEW = "state='success' AND delivery_state='unknown' AND result_type IS NOT NULL"
+HW_EXPORT_REVIEW = ("request_id LIKE 'hw:%' AND state='pending_review' AND result_type IS NULL "
+                    "AND reason IN ('hw_export_timeout','hw_export_unconfirmed')")
 
 
 def result_from_row(row):
@@ -51,6 +54,23 @@ class QueryRepository:
     async def get_exception(self, task):
         return await self.db.fetchone(
             f'SELECT * FROM query_tasks WHERE task_id=? AND (({RELEASABLE_EXCEPTION}) OR ({DELIVERY_REVIEW}))', (task,))
+
+    async def save_hw_export_candidates(self, task, candidates):
+        # Until the administrator confirms, result_text carries only review metadata.
+        async with self.db.transaction() as c:
+            await c.execute(
+                f"UPDATE query_tasks SET result_text=? WHERE task_id=? AND ({HW_EXPORT_REVIEW})",
+                (json.dumps(candidates, ensure_ascii=False), task),
+            )
+
+    async def claim_hw_export_candidate(self, task, snapshot):
+        async with self.db.transaction() as c:
+            async with c.execute(
+                f"UPDATE query_tasks SET state='collecting',phase='collecting',updated_at=? "
+                f"WHERE task_id=? AND ({HW_EXPORT_REVIEW}) AND result_text=?",
+                (time.time(), task, snapshot),
+            ) as cursor:
+                return cursor.rowcount == 1
 
     async def resolve_delivery(self, task, version, *, received):
         state = 'delivered' if received else 'not_started'

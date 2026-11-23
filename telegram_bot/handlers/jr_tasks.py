@@ -1,13 +1,18 @@
 import re
+from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .guards import authorized, protected
 from ..utils.user_messages import reason_text, state_text
 from ..storage.repositories.query_repository import result_from_row
+from ..services.hw_query_service import export_candidates, is_export_review
 
-CALLBACK_PATTERN = re.compile(r'^jrtask:(?:list|(?:select|confirm):[0-9a-f]{32}|(?:got|redo):[0-9a-f]{32}:[0-9a-f]{1,16})\Z')
+CALLBACK_PATTERN = re.compile(
+    r'^jrtask:(?:list|(?:select|confirm|scan|whole):[0-9a-f]{32}|'
+    r'(?:got|redo):[0-9a-f]{32}:[0-9a-f]{1,16}|(?:file|take):[0-9a-f]{32}:\d{1,12})\Z')
 UNAVAILABLE_TEXT = '该任务当前不可解除，可能已处理或正在交付。'
+BEIJING = timezone(timedelta(hours=8))
 
 
 def task_button(label, action):
@@ -56,6 +61,25 @@ async def resolve_delivery(ctx, task, action, version, row):
     except Exception:
         return '补发未能确认，请核对私聊消息后再处理。不会自动重发。'
     return '已补发保存的结果，没有重查。' if status == 'delivered' else '交付状态已变化，请返回列表核对。'
+
+
+def file_details(item):
+    date = datetime.fromtimestamp(item['at'], BEIJING).strftime('%m-%d %H:%M:%S')
+    size = '未知大小' if item['size'] is None else f'{item["size"]} 字节'
+    return f'{item["name"]}\n{date}（北京时间） · {size}'
+
+
+async def show_export_candidates(query, task, row, *, searched=False):
+    items = export_candidates(row)
+    buttons = [[task_button(f'查看候选 {i}', f'file:{task}:{item["id"]}')]
+               for i, item in enumerate(items, 1)]
+    buttons.append([task_button('查找已导出的 TXT', f'scan:{task}')])
+    buttons.append([task_button('解除任务', f'whole:{task}')])
+    buttons.extend(back_keyboard().inline_keyboard)
+    note = ('这些文件不会自动转发。请到 HWQ 原聊天核对后，再确认回传。' if items
+            else '未找到候选文件。' if searched else '尚无候选文件，可以只读查找已有导出。')
+    await query.edit_message_text(f'任务 {task} · 导出待核实\n{note}',
+                                  reply_markup=InlineKeyboardMarkup(buttons))
 
 
 def make_handler(ctx):
@@ -113,6 +137,27 @@ def make_callback(ctx):
                 return
             if not row:
                 await query.edit_message_text(UNAVAILABLE_TEXT, reply_markup=back_keyboard())
+                return
+            if is_export_review(row) and action != 'whole':
+                if action == 'scan':
+                    await ctx.hw.find_export_candidates(row)
+                    row = await queries.get_exception(task)
+                    await show_export_candidates(query, task, row, searched=True)
+                elif action in {'file', 'take'}:
+                    message_id = int(args[1])
+                    item = next((item for item in export_candidates(row) if item['id'] == message_id), None)
+                    if not item:
+                        await query.edit_message_text('候选文件已变化，请刷新。', reply_markup=back_keyboard())
+                    elif action == 'take':
+                        text = await ctx.hw.deliver_export_candidate(row, message_id)
+                        await query.edit_message_text(text, reply_markup=back_keyboard())
+                    else:
+                        buttons = [[task_button('确认并回传原 TXT', f'take:{task}:{message_id}')],
+                                   [task_button('返回候选文件', f'select:{task}')]]
+                        await query.edit_message_text(file_details(item) + '\n\n请确认这份文件属于当前任务。',
+                                                      reply_markup=InlineKeyboardMarkup(buttons))
+                else:
+                    await show_export_candidates(query, task, row)
                 return
             if row['state'] == 'success':
                 version = delivery_version(row)

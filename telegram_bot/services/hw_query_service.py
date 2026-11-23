@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import time
@@ -18,6 +19,7 @@ EXPORT_WAIT = 120
 CHARGE_LINE = re.compile(r'消耗\s*[0-9]+\s*盒能')
 INSUFFICIENT_BALANCE = re.compile(r'^\s*(?:[❌⚠️💰💲]\s*)*(?:盒能|余额|积分)不足(?:[\s，。！!：:]|$)')
 STATUS_MARKERS = ('数据查询中', '快捷查询完成', '安全验证', '请先验证', '请输入验证码')
+EXPORT_REVIEW_REASONS = {'hw_export_timeout', 'hw_export_unconfirmed'}
 
 
 def export_button(message):
@@ -48,23 +50,56 @@ def from_sender(message, sender):
     return getattr(message, 'sender_id', None) == sender and not getattr(message, 'out', False)
 
 
-def reply_matches(message, sender, related_ids):
+def same_chat_reference(message, sender):
+    peer = getattr(getattr(message, 'reply_to', None), 'reply_to_peer_id', None)
+    return peer is None or getattr(peer, 'user_id', None) == sender
+
+
+def reply_id(message):
     reply = getattr(message, 'reply_to_msg_id', None)
-    return from_sender(message, sender) and (reply is None or reply in related_ids)
+    return reply if reply is not None else getattr(getattr(message, 'reply_to', None), 'reply_to_msg_id', None)
+
+
+def reply_matches(message, sender, related_ids):
+    reply = reply_id(message)
+    return from_sender(message, sender) and same_chat_reference(message, sender) and (
+        reply is None or reply in related_ids)
 
 
 def linked_reply(message, sender, related_ids):
-    header = getattr(message, 'reply_to', None)
-    peer = getattr(header, 'reply_to_peer_id', None)
-    reply = getattr(message, 'reply_to_msg_id', None)
-    if reply is None:
-        reply = getattr(header, 'reply_to_msg_id', None)
-    return (from_sender(message, sender) and reply in related_ids
-            and (peer is None or getattr(peer, 'user_id', None) == sender))
+    return from_sender(message, sender) and same_chat_reference(message, sender) and reply_id(message) in related_ids
 
 
 def insufficient_balance(message):
     return bool(INSUFFICIENT_BALANCE.match(getattr(message, 'text', '') or ''))
+
+
+def candidate_metadata(message):
+    file = getattr(message, 'file', None)
+    document = getattr(message, 'document', None)
+    document_id = getattr(document, 'id', None)
+    name = getattr(file, 'name', '') or ''
+    if not document_id or not name.lower().endswith('.txt'):
+        return None
+    date = getattr(message, 'date', None)
+    return {'id': message.id, 'sender': message.sender_id, 'document': document_id,
+            'name': ' '.join(name.split())[:160], 'size': getattr(file, 'size', None),
+            'at': date.timestamp() if date else time.time()}
+
+
+def is_export_review(row):
+    return bool(row and row['request_id'].startswith('hw:') and row['state'] == QueryState.PENDING_REVIEW
+                and not row['result_type'] and row['reason'] in EXPORT_REVIEW_REASONS)
+
+
+def export_candidates(row):
+    if not is_export_review(row) or not row['result_text']:
+        return []
+    try:
+        rows = json.loads(row['result_text'])
+    except (ValueError, TypeError):
+        return []
+    return rows if isinstance(rows, list) else []
 
 
 class HWQueryService:
@@ -131,9 +166,12 @@ class HWQueryService:
                 return QueryReport(task, QueryState.FAILED, reason)
             if button is not None:
                 reason = 'hw_export_timeout'
-                exported, unconfirmed = await self._export(task, client, sent.id, result, button, sender)
+                exported, unconfirmed, candidates = await self._export(task, client, sent.id, result, button, sender)
                 if not exported:
-                    return await self._hold(task, 'hw_export_unconfirmed' if unconfirmed else reason)
+                    report = await self._hold(task, 'hw_export_unconfirmed' if unconfirmed else reason)
+                    if candidates:
+                        await self.queries.save_hw_export_candidates(task, candidates)
+                    return report
                 reason = 'document_download_failed'
                 outcome = await self.exports.download(task, client, exported)
             else:
@@ -172,6 +210,7 @@ class HWQueryService:
         if linked_reply(result, sender, related_ids):
             related_ids.add(result.id)
         unconfirmed = False
+        candidates = {}
 
         def is_file(message):
             nonlocal unconfirmed
@@ -182,10 +221,77 @@ class HWQueryService:
             if linked_reply(message, sender, related_ids):
                 return True
             unconfirmed = True
+            if len(candidates) < 5 and reply_matches(message, sender, {sent_id, result.id}):
+                metadata = candidate_metadata(message)
+                if metadata:
+                    candidates[message.id] = metadata
             return False
 
         file = await self.dialogue.wait(client, HW.bot, baseline, is_file, EXPORT_WAIT)
-        return file, unconfirmed
+        return file, unconfirmed, list(candidates.values())
+
+    async def find_export_candidates(self, row):
+        """Administrator-initiated read of the existing upstream conversation."""
+        if not is_export_review(row) or not row['source_id']:
+            return False
+        account = self.accounts.accounts.get(row['account'])
+        if not account:
+            return False
+        try:
+            async with self.accounts.operation(account, wait=False) as client:
+                source = await self.dialogue.messages(client, HW.bot, ids=row['source_id'])
+                sender = getattr(source, 'sender_id', None)
+                if not sender or getattr(source, 'out', False):
+                    return False
+                history = await self.dialogue.messages(client, HW.bot, min_id=row['source_id'], reverse=True, limit=30)
+                found = {item['id']: item for item in export_candidates(row)}
+                for message in history:
+                    date = getattr(message, 'date', None)
+                    if (message.id <= row['source_id'] or not date
+                            or not row['created_at'] <= date.timestamp() <= row['updated_at'] + 600
+                            or not reply_matches(message, sender, {row['source_id'], row['sent_id']})):
+                        continue
+                    item = candidate_metadata(message)
+                    if item and len(found) < 5:
+                        found[item['id']] = item
+                if found:
+                    await self.queries.save_hw_export_candidates(row['task_id'], list(found.values()))
+                return bool(found)
+        except Exception as error:
+            log.warning('HW candidate search failed error_type=%s', type(error).__name__)
+            return False
+
+    async def deliver_export_candidate(self, row, message_id):
+        choice = next((item for item in export_candidates(row) if item['id'] == message_id), None)
+        account = self.accounts.accounts.get(row['account']) if choice else None
+        if not account:
+            return '文件不可用，请在上游原聊天核对。'
+        try:
+            async with self.accounts.operation(account, wait=False) as client:
+                task = row['task_id']
+                if not await self.queries.claim_hw_export_candidate(task, row['result_text']):
+                    return '任务状态已变化，请刷新列表。'
+                try:
+                    message = await self.dialogue.messages(client, HW.bot, ids=message_id)
+                    if (not message or message.id != message_id or not from_sender(message, choice['sender'])
+                            or getattr(getattr(message, 'document', None), 'id', None) != choice['document']):
+                        raise ValueError('hw_candidate_changed')
+                    result = await self.exports.download(task, client, message)
+                    await self.queries.complete(task, result, time.time(), 0, cache_result=False)
+                except asyncio.CancelledError:
+                    await self._hold(task, row['reason'])
+                    raise
+                except Exception as error:
+                    log.warning('HW confirmed file read failed task=%s error_type=%s', task, type(error).__name__)
+                    await self._hold(task, row['reason'])
+                    return '未能读取选定的原文件。可以核对后再取一次，不会重新查询或导出。'
+        except AccountUnavailable:
+            return '原协议号暂不可用，请稍后再试。'
+        try:
+            status = await self.exports.deliver(task, result)
+        except Exception:
+            return '文件已保存，交付待确认。请在任务列表核对。'
+        return '已回传选定的原 TXT。' if status == 'delivered' else '交付待确认，请刷新任务列表。'
 
     async def _hold(self, task, reason):
         await self.queries.transition(task, QueryState.PENDING_REVIEW, reason)

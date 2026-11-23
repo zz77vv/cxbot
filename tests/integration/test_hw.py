@@ -15,6 +15,85 @@ def hw_message(text='', id=11, **extras):
     return message(text, id=id, sender_id=900, **extras)
 
 
+@pytest.mark.parametrize('old_task,changed', [(False, False), (True, False), (False, True)])
+async def test_hw_standalone_txt_waits_for_exact_admin_choice(setup_jr, manager, bot, client, monkeypatch,
+                                                     old_task, changed):
+    import time
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    from telegram_bot.clients.request_tracker import RequestTracker
+    from telegram_bot.handlers.jr_tasks import make_callback
+    from telegram_bot.services.hw_query_service import export_candidates
+
+    jr, queries, _, exports, _ = setup_jr
+    cfg = manager.cfg
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 0.03)
+    service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
+    client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
+    upstream = hw_message('查询结果\n测试', 12, buttons=[[KeyboardButtonCallback('导出', b'export')]])
+    file = hw_message('已导出为文件', 13, document=SimpleNamespace(id=99),
+                      file=SimpleNamespace(name='上游结果.txt', size=154), date=datetime.now(timezone.utc))
+
+    def history(target, **options):
+        identifier = options.get('ids')
+        if identifier:
+            return upstream if identifier == 12 else file
+        if options.get('min_id'):
+            return [file]
+        return ([file, upstream] if upstream.click.await_count else [upstream])[:options['limit']]
+
+    async def download(message, file):
+        Path(file).write_bytes(b'original fixture')
+        return file
+
+    client.get_messages.side_effect = history
+    client.download_media.side_effect = download
+    if old_task:
+        row, _ = await queries.claim('hw:old', 'hw:fixture', time.time() - 30)
+        task = row['task_id']
+        await queries.start_hw(task, next(iter(manager.accounts)))
+        await queries.transition(task, QueryState.PENDING_REVIEW, 'hw_export_unconfirmed', sent_id=10, source_id=12)
+    else:
+        report = await service.execute('fixture', 'sample')
+        assert report.reason == 'hw_export_unconfirmed'
+        task = report.task_id
+    bot.send_document.assert_not_awaited()
+    client.download_media.assert_not_awaited()
+    row = await queries.get_exception(task)
+    if old_task:
+        assert not export_candidates(row)
+        assert await service.find_export_candidates(row)
+        row = await queries.get_exception(task)
+    assert [item['id'] for item in export_candidates(row)] == [13]
+
+    ctx = SimpleNamespace(config=cfg, requests=RequestTracker(), hw=service, jr=jr)
+    edit = AsyncMock()
+    query = SimpleNamespace(data=f'jrtask:file:{task}:13', answer=AsyncMock(), edit_message_text=edit)
+    update = SimpleNamespace(effective_chat=SimpleNamespace(type='private'),
+                             effective_user=SimpleNamespace(id=cfg.admin_id), callback_query=query)
+    callback = make_callback(ctx)
+    await callback(update, None)
+    assert '154 字节' in edit.call_args.args[0]
+    query.data = edit.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data
+    assert len(query.data.encode()) <= 64
+    client.download_media.assert_not_awaited()
+    if changed:
+        file.document.id = 100
+    await callback(update, None)
+    if changed:
+        assert (await queries.get(task))['state'] == QueryState.PENDING_REVIEW
+        client.download_media.assert_not_awaited()
+        bot.send_document.assert_not_awaited()
+    else:
+        await callback(update, None)
+        assert (await queries.get(task))['delivery_state'] == 'delivered'
+        client.download_media.assert_awaited_once()
+        bot.send_document.assert_awaited_once()
+        assert bot.send_document.call_args.kwargs['filename'] == '上游结果.txt'
+    assert client.send_message.await_count == upstream.click.await_count == (0 if old_task else 1)
+
+
 async def test_hw_unlinked_text_does_not_deliver_or_repeat(setup_jr, manager, client, bot, monkeypatch):
     _, queries, _, exports, _ = setup_jr
     monkeypatch.setattr('telegram_bot.services.hw_query_service.RESULT_WAIT', 0.03)
