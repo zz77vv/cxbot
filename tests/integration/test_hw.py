@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -28,7 +29,8 @@ async def test_hw_standalone_txt_waits_for_exact_admin_choice(setup_jr, manager,
 
     jr, queries, _, exports, _ = setup_jr
     cfg = manager.cfg
-    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 0.03)
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_WAIT', 3)
+    monkeypatch.setattr('telegram_bot.services.hw_query_service.EXPORT_LINK_GRACE', 0.03)
     service = HWQueryService(cfg, manager, Dialogue(cfg), queries, exports)
     client.send_message.return_value = SimpleNamespace(id=10, peer_id=SimpleNamespace(user_id=900))
     upstream = hw_message('查询结果\n测试', 12, buttons=[[KeyboardButtonCallback('导出', b'export')]])
@@ -55,7 +57,7 @@ async def test_hw_standalone_txt_waits_for_exact_admin_choice(setup_jr, manager,
         await queries.start_hw(task, next(iter(manager.accounts)))
         await queries.transition(task, QueryState.PENDING_REVIEW, 'hw_export_unconfirmed', sent_id=10, source_id=12)
     else:
-        report = await service.execute('fixture', 'sample')
+        report = await asyncio.wait_for(service.execute('fixture', 'sample'), 1)
         assert report.reason == 'hw_export_unconfirmed'
         task = report.task_id
     bot.send_document.assert_not_awaited()
@@ -237,7 +239,7 @@ async def test_hw_export_requires_same_chat_reply_chain(setup_jr, manager, bot, 
                                  reply_to_msg_id=None if case in ('unlinked_parent', 'direct') else 10,
                                  buttons=[[KeyboardButtonCallback('导出', b'export')]])
     reply = {'unlinked': None, 'other_task': 8, 'direct': 10, 'valid_after_unlinked': None}.get(case, 12)
-    candidate = hw_message('已导出为文件', 13, reply_to_msg_id=reply, document=True,
+    candidate = hw_message('已导出为文件', 13, reply_to_msg_id=reply, document=SimpleNamespace(id=99),
                            file=SimpleNamespace(name='待验证.txt'))
     if case == 'cross_chat':
         candidate.reply_to = SimpleNamespace(reply_to_peer_id=SimpleNamespace(user_id=999))

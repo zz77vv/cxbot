@@ -16,6 +16,7 @@ from .jr.cache_service import jr_cache_key
 log = logging.getLogger(__name__)
 RESULT_WAIT = 90
 EXPORT_WAIT = 120
+EXPORT_LINK_GRACE = 3
 CHARGE_LINE = re.compile(r'消耗\s*[0-9]+\s*盒能')
 INSUFFICIENT_BALANCE = re.compile(r'^\s*(?:[❌⚠️💰💲]\s*)*(?:盒能|余额|积分)不足(?:[\s，。！!：:]|$)')
 STATUS_MARKERS = ('数据查询中', '快捷查询完成', '安全验证', '请先验证', '请输入验证码')
@@ -212,7 +213,7 @@ class HWQueryService:
         unconfirmed = False
         candidates = {}
 
-        def is_file(message):
+        def is_file(message, *, accept_candidate=False):
             nonlocal unconfirmed
             name = getattr(getattr(message, 'file', None), 'name', '') or ''
             if not (from_sender(message, sender) and getattr(message, 'document', None)
@@ -225,9 +226,21 @@ class HWQueryService:
                 metadata = candidate_metadata(message)
                 if metadata:
                     candidates[message.id] = metadata
+                    return accept_candidate
             return False
 
-        file = await self.dialogue.wait(client, HW.bot, baseline, is_file, EXPORT_WAIT)
+        deadline = time.monotonic() + EXPORT_WAIT
+        file = await self.dialogue.wait(
+            client, HW.bot, baseline,
+            lambda message: is_file(message, accept_candidate=True), EXPORT_WAIT,
+        )
+        if file and not linked_reply(file, sender, related_ids):
+            grace = min(EXPORT_LINK_GRACE, max(0, deadline - time.monotonic()))
+            try:
+                file = await self.dialogue.wait(client, HW.bot, baseline, is_file, grace) if grace else None
+            except OSError:
+                # The candidate is already known. Preserve it if the extra read fails.
+                file = None
         return file, unconfirmed, list(candidates.values())
 
     async def find_export_candidates(self, row):
