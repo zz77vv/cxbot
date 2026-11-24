@@ -127,6 +127,25 @@ def classify(message):
     return 'unknown'
 
 
+def is_basic_info_reply(message, query):
+    if any(getattr(message, attr, None) for attr in ('buttons', 'media', 'document', 'file')):
+        return False
+    query = query.strip().upper()
+    if not re.fullmatch(r'[0-9]{17}[0-9X]', query):
+        return False
+    labels = ('证件', '出生', '性别', '生日', '年龄', '生肖')
+    lines = [line for line in (message.text or '').splitlines() if line.strip()]
+    if len(lines) != len(labels):
+        return False
+    for label, line in zip(labels, lines):
+        name, separator, value = line.replace('：', ':').partition(':')
+        if not separator or name.strip() != label or ':' in value:
+            return False
+        if label == '证件' and value.strip().upper() != query:
+            return False
+    return True
+
+
 def normalize_jr_full_result(text):
     lines, header, blank = [], False, False
     for raw in (text or '').replace('`', '').splitlines():

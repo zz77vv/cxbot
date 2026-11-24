@@ -43,6 +43,7 @@ REASONS = {
     'partial_page_timeout': '翻页超时，查询只收集到部分结果，请先核实目标记录。',
     'explicit_target_failure': '目标机器人明确返回查询失败或积分不足。',
     'unrecognized_target_reply': '目标回复格式无法确认，请人工核实。',
+    'jr_basic_info_only': '查询空',
     'purchase_reply_timeout': '购买后的回复超时，结果不确定；系统不会再次购买。',
     'purchase_not_confirmed': '尚未确认购买结果，系统不会再次购买。',
     'verification_after_purchase': '购买后出现验证，请人工处理并核实费用。',

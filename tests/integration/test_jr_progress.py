@@ -33,6 +33,40 @@ def edits(progress):
     return [c.args[0] for c in progress.message.edit_text.await_args_list]
 
 
+@pytest.mark.parametrize('case', ['exact', 'blank_values', 'mismatch', 'order', 'missing', 'extra', 'duplicate', 'button', 'attachment'])
+async def test_basic_info_only_reply(setup_jr, progress, db, case):
+    jr, repo, target, *_ = setup_jr
+    number = '00000000000000000X'
+    lines = [f'证件： {number}', '出生: 示例', '性别：女', '生日: 2000-01-01', '年龄: 20', '生肖：示例']
+    if case == 'blank_values':
+        lines[1:] = ['出生:', '性别：', '生日:', '年龄:', '生肖：']
+    elif case == 'mismatch':
+        lines[0] = '证件：000000000000000000'
+    elif case == 'order':
+        lines[1], lines[2] = lines[2], lines[1]
+    elif case == 'missing':
+        lines.pop()
+    elif case == 'extra':
+        lines.append('备注：其他')
+    elif case == 'duplicate':
+        lines[-1] = lines[1]
+    reply = message('\n\n'.join(lines), buttons=[[button('详情')]] if case == 'button' else None,
+                    media=True if case == 'attachment' else None)
+    target.ready.return_value = reply
+    report = await execute(jr, progress, text=number)
+    assert report.state == QueryState.PENDING_REVIEW
+    if case in ('exact', 'blank_values'):
+        assert edits(progress)[-1] == '查询空'
+        assert (await repo.get(report.task_id))['reason'] == 'jr_basic_info_only'
+    else:
+        assert report.reason == 'unrecognized_target_reply'
+        assert '查询空' not in edits(progress)[-1]
+    assert number not in edits(progress)[-1]
+    assert await db.fetchone('SELECT * FROM jr_result_cache') is None
+    target.submit.assert_awaited_once()
+    target.click_and_wait.assert_not_awaited()
+
+
 def page(n, total=7):
     return message(f'🔍️共39条信息 (第 {n} 页，共 {total} 页):\n数据 {n}', id=20+n,
                    buttons=[[button('下一页')]] if n < total else None)

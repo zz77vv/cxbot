@@ -10,7 +10,7 @@ from ...utils.keyed_locks import KeyedLocks
 from .cache_service import jr_cache_key, CacheInconsistent
 from .account_selector import NoEligibleAccountError, RateLimitEncountered
 from .pagination import CollectedPages, ManualVerification
-from .result_parser import classify, find_buy_button, parse_query_cooldown
+from .result_parser import classify, find_buy_button, is_basic_info_reply, parse_query_cooldown
 from .scheduler import AccountScheduler
 from .verification_service import VerificationError
 
@@ -120,6 +120,8 @@ class Orchestrator:
                         await self.repository.transition(task, QueryState.FAILED, 'explicit_target_failure')
                         return QueryReport(task, QueryState.FAILED, 'explicit_target_failure')
                     if kind != 'result':
+                        if kind == 'unknown' and is_basic_info_reply(reply, text):
+                            return await self._hold(task, QueryState.PENDING_REVIEW, 'jr_basic_info_only', progress=progress)
                         return await self._hold(task, QueryState.PENDING_REVIEW, 'unrecognized_target_reply', progress=progress)
                     buy = find_buy_button(reply)
                     if buy:

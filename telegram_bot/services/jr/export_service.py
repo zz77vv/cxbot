@@ -148,6 +148,9 @@ class ExportService:
 
     async def notify(self, task, state, reason, *, label='巨人查询'):
         try:
+            if reason == 'jr_basic_info_only':
+                await self.bot.send_message(chat_id=self.cfg.admin_id, text=reason_text(reason))
+                return
             await self.bot.send_message(chat_id=self.cfg.admin_id,
                 text=f'⚠️ {label}任务 {task}\n状态：{state_text(state)}\n原因：{reason_text(reason)}\n请核实目标机器人记录；系统不会自动重做。')
         except Exception as error:

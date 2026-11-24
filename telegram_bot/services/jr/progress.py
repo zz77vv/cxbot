@@ -93,6 +93,9 @@ class JRProgress:
             log.warning('event=progress_delete_failed task=%s error_type=%s', self.task_id, type(error).__name__)
 
     async def fail(self, task, state, reason):
+        if reason == 'jr_basic_info_only':
+            await self._edit(reason_text(reason))
+            return
         await self._edit(f'任务：{task or "未创建"}\n状态：{state_text(state)}\n说明：{reason_text(reason)}')
 
     async def finish(self, report):
