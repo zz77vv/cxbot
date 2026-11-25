@@ -1,4 +1,4 @@
-from telegram_bot.bootstrap import main
+from bot.app import main
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
