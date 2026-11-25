@@ -30,9 +30,10 @@ def parse_balance_text(text: str, target: TargetBot) -> int | None:
 
 
 class BalanceService:
-    def __init__(self, pool: UserbotPool, cache_ttl: int = 60):
+    def __init__(self, pool: UserbotPool, cache_ttl: int = 60, on_balance_updated=None):
         self.pool = pool
         self.cache_ttl = cache_ttl
+        self.on_balance_updated = on_balance_updated
         # (phone, bot_key) -> (value, expires_at)
         self._cache: dict[tuple[str, str], tuple[int, float]] = {}
 
@@ -43,43 +44,59 @@ class BalanceService:
         else:
             self._cache.pop((phone, bot_key), None)
 
+    def _get_cached(self, cache_key: tuple[str, str]) -> BalanceResult | None:
+        if self.cache_ttl <= 0:
+            return None
+        cached = self._cache.get(cache_key)
+        if cached and cached[1] > time.monotonic():
+            return BalanceResult(ok=True, value=cached[0], reason="cached")
+        return None
+
     async def query(
         self, account: Account, target: TargetBot, *, use_cache: bool = False
     ) -> BalanceResult:
         cache_key = (account.phone, target.key)
-        if use_cache and self.cache_ttl > 0:
-            cached = self._cache.get(cache_key)
-            if cached and cached[1] > time.monotonic():
-                return BalanceResult(ok=True, value=cached[0], reason="cached")
+        if use_cache:
+            hit = self._get_cached(cache_key)
+            if hit is not None:
+                return hit
 
         try:
-            async with self.pool.use(account) as client:
-                sent = await asyncio.wait_for(
-                    client.send_message(target.username, target.balance_cmd),
-                    self.pool.cfg.reply_timeout,
-                )
-                observed = False
+            async with self.pool.hold_account(account) as client:
+                # Double-checked locking: 防止并发穿透重复发 /balance
+                if use_cache:
+                    hit = self._get_cached(cache_key)
+                    if hit is not None:
+                        return hit
+                async with self.pool.rpc_slot():
+                    sent = await asyncio.wait_for(
+                        client.send_message(target.username, target.balance_cmd),
+                        self.pool.cfg.reply_timeout,
+                    )
+                    observed = False
 
-                def _matched(msg) -> bool:
-                    nonlocal observed
-                    text = getattr(msg, "text", "") or ""
-                    if text:
-                        observed = True
-                    return parse_balance_text(text, target) is not None
+                    def _matched(msg) -> bool:
+                        nonlocal observed
+                        text = getattr(msg, "text", "") or ""
+                        if text:
+                            observed = True
+                        return parse_balance_text(text, target) is not None
 
-                reply = await wait_reply(
-                    client,
-                    target.username,
-                    sent.id,
-                    _matched,
-                    target.balance_timeout,
-                    rpc_timeout=self.pool.cfg.reply_timeout,
-                )
+                    reply = await wait_reply(
+                        client,
+                        target.username,
+                        sent.id,
+                        _matched,
+                        target.balance_timeout,
+                        rpc_timeout=self.pool.cfg.reply_timeout,
+                    )
                 if reply is not None:
                     val = parse_balance_text(getattr(reply, "text", ""), target)
                     if val is not None:
                         if self.cache_ttl > 0:
                             self._cache[cache_key] = (val, time.monotonic() + self.cache_ttl)
+                        if self.on_balance_updated:
+                            self.on_balance_updated(account.phone, target.key, val)
                         return BalanceResult(ok=True, value=val)
                 return BalanceResult(
                     ok=False,

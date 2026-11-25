@@ -1,4 +1,4 @@
-"""单线程隔离的离线 OCR 服务（修复重复字切分与候选按钮索引映射）。"""
+"""单线程隔离的离线 OCR 服务（懒加载 ddddocr + 自适应阈值切分 + 按钮精确匹配）。"""
 from __future__ import annotations
 
 import asyncio
@@ -12,12 +12,10 @@ from io import BytesIO
 
 from PIL import Image, ImageFilter, ImageOps
 
-with warnings.catch_warnings():
-    import ddddocr
-
 from .targets import OCR_IGNORE_BUTTON_KEYWORDS, OCR_MIN_CONFIDENCE
 
 log = logging.getLogger(__name__)
+SEGMENT_THRESHOLDS = (115, 140, 90)
 
 
 class OCRError(RuntimeError):
@@ -60,6 +58,43 @@ def _to_png_bytes(img: Image.Image) -> bytes:
     return buf.getvalue()
 
 
+def _default_engine_factory():
+    # 懒加载 ddddocr/onnxruntime，降低启动耗时和闲时内存占用
+    with warnings.catch_warnings():
+        import ddddocr
+
+        return ddddocr.DdddOcr(beta=True, show_ad=False)
+
+
+def _segment_band(denoised: Image.Image, threshold: int) -> list[list[int]]:
+    bw = denoised.point(lambda v: 0 if v < threshold else 255)
+    bw_w, bw_h = bw.size
+    pix = bw.load()
+    col_counts = [sum(1 for y in range(bw_h) if pix[x, y] == 0) for x in range(bw_w)]
+
+    segments: list[list[int]] = []
+    in_seg = False
+    start = 0
+    for x, cnt in enumerate(col_counts):
+        if cnt >= 5 and not in_seg:
+            in_seg = True
+            start = x
+        elif cnt < 5 and in_seg:
+            in_seg = False
+            if x - start >= 12:
+                segments.append([start, x])
+    if in_seg and bw_w - start >= 12:
+        segments.append([start, bw_w])
+
+    merged: list[list[int]] = []
+    for seg in segments:
+        if merged and seg[0] - merged[-1][1] < 15:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append(seg)
+    return merged
+
+
 def _classify_with_confidence(image_bytes: bytes, engine) -> tuple[str, float | None]:
     result = engine.classification(image_bytes, probability=True, png_fix=True)
     if isinstance(result, str):
@@ -97,11 +132,7 @@ def recognize_duplicate_char_sync(
     candidate_labels: list[str],
     engine,
 ) -> tuple[int, str, float]:
-    """识别「点击图中出现两次的字」验证码。
-
-    返回 `(button_index_0based, matched_char, confidence)`。
-    直接与 `candidate_labels` 对齐，避免多字符按钮导致的索引错位。
-    """
+    """识别「点击图中出现两次的字」验证码（自适应多阈值切分 + 按钮精确匹配）。"""
     if not candidate_labels:
         raise OCRError("InvalidCandidates")
 
@@ -115,31 +146,13 @@ def recognize_duplicate_char_sync(
     gray = image.convert("L")
     band = gray.crop((0, int(height * 0.40), width, int(height * 0.90)))
     denoised = band.filter(ImageFilter.MedianFilter(size=3))
-    bw = denoised.point(lambda v: 0 if v < 115 else 255)
-    bw_w, bw_h = bw.size
-    pix = bw.load()
-    col_counts = [sum(1 for y in range(bw_h) if pix[x, y] == 0) for x in range(bw_w)]
-
-    segments: list[list[int]] = []
-    in_seg = False
-    start = 0
-    for x, cnt in enumerate(col_counts):
-        if cnt >= 5 and not in_seg:
-            in_seg = True
-            start = x
-        elif cnt < 5 and in_seg:
-            in_seg = False
-            if x - start >= 12:
-                segments.append([start, x])
-    if in_seg and bw_w - start >= 12:
-        segments.append([start, bw_w])
+    bw_h = band.size[1]
 
     merged: list[list[int]] = []
-    for seg in segments:
-        if merged and seg[0] - merged[-1][1] < 15:
-            merged[-1][1] = seg[1]
-        else:
-            merged.append(seg)
+    for threshold in SEGMENT_THRESHOLDS:
+        merged = _segment_band(denoised, threshold)
+        if len(merged) >= 2:
+            break
     if len(merged) < 2:
         raise OCRError("SegmentationFailed")
 
@@ -188,7 +201,7 @@ def recognize_duplicate_char_sync(
 class OCRService:
     def __init__(self, timeout: float = 20.0, engine_factory=None):
         self.timeout = timeout
-        self._engine_factory = engine_factory or (lambda: ddddocr.DdddOcr(beta=True, show_ad=False))
+        self._engine_factory = engine_factory or _default_engine_factory
         self._engine = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ocr-worker")
         self._lock = asyncio.Lock()

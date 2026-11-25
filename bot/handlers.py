@@ -1,4 +1,4 @@
-"""Telegram Bot 命令与回调路由（单管理员守卫 + 简洁交互）。"""
+"""Telegram Bot 命令与回调路由（单管理员守卫 + 节流进度编辑 + 在途请求追踪）。"""
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from .targets import JR_FREE_DAILY_LIMIT, TARGETS
+from .utils import ProgressEditor, split_text
 
 log = logging.getLogger(__name__)
 
@@ -51,35 +52,6 @@ STATE_LABELS = {
     "timeout": "超时",
     "rate_limited": "限流",
 }
-
-
-def utf16_len(text: str) -> int:
-    return len(text.encode("utf-16-le")) // 2
-
-
-def split_text(text: str, limit: int = 3800) -> list[str]:
-    chunks: list[str] = []
-    cur = ""
-    cur_len = 0
-    for line in (text or "").splitlines(keepends=True):
-        size = utf16_len(line)
-        if cur and cur_len + size > limit:
-            chunks.append(cur)
-            cur, cur_len = "", 0
-        if size <= limit:
-            cur += line
-            cur_len += size
-        else:
-            for ch in line:
-                csize = utf16_len(ch)
-                if cur_len + csize > limit:
-                    chunks.append(cur)
-                    cur, cur_len = "", 0
-                cur += ch
-                cur_len += csize
-    if cur:
-        chunks.append(cur)
-    return chunks or [""]
 
 
 async def safe_edit(msg, text: str) -> None:
@@ -130,6 +102,10 @@ def register_handlers(application: Application, app) -> None:
             if update.effective_message:
                 await update.effective_message.reply_text("⛔ 仅限管理员使用本机器人。")
             raise ApplicationHandlerStop
+        if not app.accepting:
+            if update.effective_message:
+                await update.effective_message.reply_text("⏳ 机器人正在关闭或重启，请稍后再试。")
+            raise ApplicationHandlerStop
 
     async def on_start_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat and update.effective_chat.type == "private":
@@ -140,51 +116,52 @@ def register_handlers(application: Application, app) -> None:
         await update.effective_message.reply_text("\n".join(lines))
 
     async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        accounts = tuple(app.pool.accounts.values())
-        await asyncio.gather(*(app.pool.refresh(a) for a in accounts if not a.lock.locked()))
-        meta_map = await app.db.all_account_meta()
-        checkins = await app.db.all_checkins()
-        bot_names = {t.key: t.name for t in TARGETS}
-        ck_by_phone: dict[str, list[str]] = {}
-        for row in checkins:
-            if row["bot_key"] in bot_names:
-                st = STATE_LABELS.get(row["last_status"], row["last_status"])
-                ck_by_phone.setdefault(row["phone"], []).append(f"{bot_names[row['bot_key']]}:{st}")
+        async with app.track_request():
+            accounts = tuple(app.pool.accounts.values())
+            await asyncio.gather(*(app.pool.refresh(a) for a in accounts if not a.lock.locked()))
+            meta_map = await app.db.all_account_meta()
+            checkins = await app.db.all_checkins()
+            bot_names = {t.key: t.name for t in TARGETS}
+            ck_by_phone: dict[str, list[str]] = {}
+            for row in checkins:
+                if row["bot_key"] in bot_names:
+                    st = STATE_LABELS.get(row["last_status"], row["last_status"])
+                    ck_by_phone.setdefault(row["phone"], []).append(f"{bot_names[row['bot_key']]}:{st}")
 
-        now = time.time()
-        lines = ["📡 协议号运行状态"]
-        for acc in accounts:
-            meta = meta_map.get(acc.phone, {})
-            st = STATE_LABELS.get(acc.state.value, acc.state.value)
-            extras: list[str] = []
-            if acc.error_type:
-                extras.append(acc.error_type)
-            if acc.flood_until > now:
-                extras.append(f"限流剩{math.ceil(acc.flood_until - now)}s")
-            cd = meta.get("jr_cooldown_until", 0.0)
-            if cd > now:
-                extras.append(f"JR冷却剩{math.ceil(cd - now)}s")
-            mem = meta.get("jr_membership", "unknown")
-            if mem == "member":
-                extras.append("JR会员")
-            else:
-                used = await app.db.get_jr_daily_usage(acc.phone)
-                extras.append(f"JR今日 {used}/{JR_FREE_DAILY_LIMIT}")
-            suffix = f"（{' · '.join(extras)}）" if extras else ""
-            lines.append(f"• {acc.phone}：{st}{suffix}")
-            if acc.phone in ck_by_phone:
-                lines.append("  最近签到：" + "，".join(ck_by_phone[acc.phone]))
+            now = time.time()
+            lines = ["📡 协议号运行状态"]
+            for acc in accounts:
+                meta = meta_map.get(acc.phone, {})
+                st = STATE_LABELS.get(acc.state.value, acc.state.value)
+                extras: list[str] = []
+                if acc.error_type:
+                    extras.append(acc.error_type)
+                if acc.flood_until > now:
+                    extras.append(f"限流剩{math.ceil(acc.flood_until - now)}s")
+                cd = meta.get("jr_cooldown_until", 0.0)
+                if cd > now:
+                    extras.append(f"JR冷却剩{math.ceil(cd - now)}s")
+                mem = meta.get("jr_membership", "unknown")
+                if mem == "member":
+                    extras.append("JR会员")
+                else:
+                    used = await app.db.get_jr_daily_usage(acc.phone)
+                    extras.append(f"JR今日 {used}/{JR_FREE_DAILY_LIMIT}")
+                suffix = f"（{' · '.join(extras)}）" if extras else ""
+                lines.append(f"• {acc.phone}：{st}{suffix}")
+                if acc.phone in ck_by_phone:
+                    lines.append("  最近签到：" + "，".join(ck_by_phone[acc.phone]))
 
-        online_cnt = sum(1 for a in accounts if a.state.value == "online")
-        lines.append(f"\n总账号：{len(accounts)} ｜ 在线：{online_cnt}")
-        await send_long(update.effective_message, "\n".join(lines))
+            online_cnt = sum(1 for a in accounts if a.state.value == "online")
+            lines.append(f"\n总账号：{len(accounts)} ｜ 在线：{online_cnt} ｜ 进行中请求：{len(app.active_requests)}")
+            await send_long(update.effective_message, "\n".join(lines))
 
     async def on_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         if app.checkins.manual_lock.locked():
             await msg.reply_text("已有手动签到正在进行，请稍候。")
             return
-        async with app.checkins.manual_lock:
+        async with app.track_request(), app.checkins.manual_lock:
             progress = await msg.reply_text("⏳ 正在执行全账号签到，最多等待 4 分钟…")
             results = await app.checkins.run_manual_all()
             lines = ["📋 手动签到汇总"]
@@ -205,7 +182,7 @@ def register_handlers(application: Application, app) -> None:
         if balance_lock.locked():
             await msg.reply_text("已有积分查询正在进行，请稍候。")
             return
-        async with balance_lock:
+        async with app.track_request(), balance_lock:
             progress = await msg.reply_text("⏳ 正在查询全账号三平台积分，最多等待 4 分钟…")
             results = await app.balances.query_all()
             lines = ["📊 账号积分汇总"]
@@ -221,27 +198,31 @@ def register_handlers(application: Application, app) -> None:
             for chunk in chunks[1:]:
                 await msg.reply_text(chunk)
 
-    async def _deliver_jr_result(chat_id: int, bot, progress_msg, res) -> None:
+    async def _deliver_jr_result(chat_id: int, bot, editor: ProgressEditor, res) -> None:
         if not res.ok:
-            await safe_edit(progress_msg, f"❌ 巨人查询未完成：{res.reason}")
+            await editor.update(f"❌ 巨人查询未完成：{res.reason}", force=True)
             return
         if res.kind == "empty":
-            await safe_edit(progress_msg, res.text or "查询空")
+            await editor.update(res.text or "查询空", force=True)
             return
         if res.kind == "file" and res.file_path:
             path = Path(res.file_path)
             with path.open("rb") as f:
-                caption = "⚠️ 部分结果（翻页超时）" if res.partial else ("✅ 巨人查询完成（缓存）" if res.from_cache else "✅ 巨人查询完成")
+                caption = (
+                    "⚠️ 部分结果（翻页未完整）"
+                    if res.partial
+                    else ("✅ 巨人查询完成（缓存）" if res.from_cache else "✅ 巨人查询完成")
+                )
                 await bot.send_document(chat_id=chat_id, document=f, filename=res.file_name, caption=caption)
             try:
-                await progress_msg.delete()
+                await editor.message.delete()
             except TelegramError:
-                await safe_edit(progress_msg, "✅ 结果文件已发送。")
+                await editor.update("✅ 结果文件已发送。", force=True)
             return
 
         prefix = "✅ 巨人查询完成（命中缓存）\n\n" if res.from_cache else "✅ 巨人查询完成\n\n"
         chunks = split_text(prefix + res.text)
-        await safe_edit(progress_msg, chunks[0])
+        await editor.update(chunks[0], force=True)
         for chunk in chunks[1:]:
             await bot.send_message(chat_id=chat_id, text=chunk)
 
@@ -257,25 +238,49 @@ def register_handlers(application: Application, app) -> None:
         lines = list(dict.fromkeys(ln.strip() for ln in body.splitlines() if ln.strip()))
         chat_id = update.effective_chat.id
 
-        if len(lines) == 1:
-            progress = await msg.reply_text("⏳ 收到巨人查询任务，准备处理…")
-            res = await app.jr.query(lines[0], on_progress=lambda t: safe_edit(progress, t))
-            await _deliver_jr_result(chat_id, context.bot, progress, res)
-            return
+        async with app.track_request():
+            if len(lines) == 1:
+                progress = await msg.reply_text("⏳ 收到巨人查询任务，准备处理…")
+                editor = ProgressEditor(progress)
+                res = await app.jr.query(lines[0], on_progress=editor.update)
+                await _deliver_jr_result(chat_id, context.bot, editor, res)
+                return
 
-        summary = await msg.reply_text(f"📦 巨人批量查询：共 {len(lines)} 条（已去重），逐条执行…")
-        ok_cnt = fail_cnt = 0
-        for idx, item in enumerate(lines, 1):
-            if app.pool.stopping:
-                break
-            p_msg = await msg.reply_text(f"⏳ [{idx}/{len(lines)}] 正在查询…")
-            res = await app.jr.query(item, on_progress=lambda t, pm=p_msg, i=idx: safe_edit(pm, f"[{i}/{len(lines)}] {t}"))
-            await _deliver_jr_result(chat_id, context.bot, p_msg, res)
-            if res.ok:
-                ok_cnt += 1
+            summary = await msg.reply_text(f"📦 巨人批量查询：共 {len(lines)} 条（已去重），逐条执行…")
+            summary_ed = ProgressEditor(summary, min_interval=1.0)
+            ok_cnt = fail_cnt = 0
+            stopped_reason = ""
+            for idx, item in enumerate(lines, 1):
+                if not app.accepting or app.pool.stopping:
+                    stopped_reason = "程序正在关闭"
+                    break
+                p_msg = await msg.reply_text(f"⏳ [{idx}/{len(lines)}] 正在查询…")
+                p_ed = ProgressEditor(p_msg)
+                res = await app.jr.query(
+                    item,
+                    on_progress=lambda t, ed=p_ed, i=idx: ed.update(f"[{i}/{len(lines)}] {t}"),
+                )
+                await _deliver_jr_result(chat_id, context.bot, p_ed, res)
+                if res.ok:
+                    ok_cnt += 1
+                else:
+                    fail_cnt += 1
+                    if res.fatal_batch:
+                        stopped_reason = res.reason
+                        break
+                await summary_ed.update(f"📦 巨人批量进度：{idx}/{len(lines)}（成功 {ok_cnt}，失败 {fail_cnt}）")
+
+            remain = len(lines) - ok_cnt - fail_cnt
+            if stopped_reason:
+                await summary_ed.update(
+                    f"⚠️ 巨人批量已提前暂停：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}\n原因：{stopped_reason}",
+                    force=True,
+                )
             else:
-                fail_cnt += 1
-            await safe_edit(summary, f"📦 巨人批量进度：{idx}/{len(lines)}（成功 {ok_cnt}，失败 {fail_cnt}）")
+                await summary_ed.update(
+                    f"✅ 巨人批量完成：共 {len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）",
+                    force=True,
+                )
 
     async def on_hw(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
@@ -293,32 +298,36 @@ def register_handlers(application: Application, app) -> None:
         lines = list(dict.fromkeys(ln.strip() for ln in parts[1].splitlines() if ln.strip()))
         chat_id = update.effective_chat.id
 
-        async with hw_batch_lock:
+        async with app.track_request(), hw_batch_lock:
             if len(lines) == 1:
                 progress = await msg.reply_text("⏳ 正在查询核武器…")
-                res = await app.hw.query(lines[0], on_progress=lambda t: safe_edit(progress, t))
+                editor = ProgressEditor(progress)
+                res = await app.hw.query(lines[0], on_progress=editor.update)
                 if not res.ok:
-                    await safe_edit(progress, f"❌ 核武器查询失败：{res.reason}")
+                    await editor.update(f"❌ 核武器查询失败：{res.reason}", force=True)
                 elif res.kind == "file" and res.file_path:
                     with Path(res.file_path).open("rb") as f:
                         await context.bot.send_document(chat_id=chat_id, document=f, filename=res.file_name)
                     try:
                         await progress.delete()
                     except TelegramError:
-                        await safe_edit(progress, "✅ 核武器 TXT 已发送。")
+                        await editor.update("✅ 核武器 TXT 已发送。", force=True)
                 else:
                     chunks = split_text(res.text)
-                    await safe_edit(progress, chunks[0])
+                    await editor.update(chunks[0], force=True)
                     for chunk in chunks[1:]:
                         await context.bot.send_message(chat_id=chat_id, text=chunk)
                 return
 
             summary = await msg.reply_text(f"📦 核武器批量查询：共 {len(lines)} 条，逐条执行…")
+            summary_ed = ProgressEditor(summary, min_interval=1.0)
             ok_cnt = fail_cnt = 0
+            stopped_reason = ""
             for idx, item in enumerate(lines, 1):
-                if app.pool.stopping:
+                if not app.accepting or app.pool.stopping:
+                    stopped_reason = "程序正在关闭"
                     break
-                await safe_edit(summary, f"⏳ 核武器批量第 {idx}/{len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）…")
+                await summary_ed.update(f"⏳ 核武器批量第 {idx}/{len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）…")
                 res = await app.hw.query(item)
                 if res.ok:
                     ok_cnt += 1
@@ -331,7 +340,21 @@ def register_handlers(application: Application, app) -> None:
                 else:
                     fail_cnt += 1
                     await context.bot.send_message(chat_id=chat_id, text=f"❌ 第 {idx} 条查询失败：{res.reason}")
-            await safe_edit(summary, f"✅ 核武器批量完成：共 {len(lines)} 条，成功 {ok_cnt}，失败 {fail_cnt}。")
+                    if res.fatal_batch:
+                        stopped_reason = res.reason
+                        break
+
+            remain = len(lines) - ok_cnt - fail_cnt
+            if stopped_reason:
+                await summary_ed.update(
+                    f"⚠️ 核武器批量已提前暂停：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}\n原因：{stopped_reason}",
+                    force=True,
+                )
+            else:
+                await summary_ed.update(
+                    f"✅ 核武器批量完成：共 {len(lines)} 条，成功 {ok_cnt}，失败 {fail_cnt}。",
+                    force=True,
+                )
 
     async def on_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_chat or update.effective_chat.type != "private":
@@ -364,7 +387,6 @@ def register_handlers(application: Application, app) -> None:
     async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
         log.error("处理 Telegram 更新异常", exc_info=context.error)
 
-    # 注册顺序：全局管理员守卫 -> 回调 -> 命令 -> 登录文本输入
     application.add_handler(MessageHandler(filters.ALL, admin_only), group=-1)
     application.add_handler(
         CallbackQueryHandler(app.manual_verify.handle_callback, pattern=r"^jrverify:[\w-]+:\d+$")

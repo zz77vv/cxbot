@@ -98,6 +98,17 @@ def find_button(message: Any, keywords: tuple[str, ...]) -> tuple[int, int, str]
     return None
 
 
+async def _read_with_retry(coro_factory, rpc_timeout: float, retries: int = 2):
+    """仅用于只读 get_messages 的短退避重试，绝不重试发送或点击。"""
+    for attempt in range(retries + 1):
+        try:
+            return await asyncio.wait_for(coro_factory(), rpc_timeout)
+        except (ConnectionError, OSError):
+            if attempt == retries:
+                raise
+            await asyncio.sleep(0.6 * (attempt + 1))
+
+
 async def wait_reply(
     client: Any,
     bot_username: str,
@@ -110,12 +121,13 @@ async def wait_reply(
     interval: float = 0.8,
     rpc_timeout: float = 30.0,
 ) -> Any | None:
-    """只读轮询目标机器人回复（同时监听原消息编辑与新消息）。"""
+    """只读轮询目标机器人回复（同时监听原消息编辑与新消息，网络瞬断自动重试）。"""
     async def _poll():
         while True:
             if original is not None:
-                refreshed = await asyncio.wait_for(
-                    client.get_messages(bot_username, ids=original.id), rpc_timeout
+                refreshed = await _read_with_retry(
+                    lambda: client.get_messages(bot_username, ids=original.id),
+                    rpc_timeout,
                 )
                 if (
                     refreshed
@@ -124,8 +136,9 @@ async def wait_reply(
                     and predicate(refreshed)
                 ):
                     return refreshed
-            msgs = await asyncio.wait_for(
-                client.get_messages(bot_username, limit=10), rpc_timeout
+            msgs = await _read_with_retry(
+                lambda: client.get_messages(bot_username, limit=10),
+                rpc_timeout,
             )
             for m in sorted(msgs, key=lambda x: x.id):
                 if m.id > after_id and not getattr(m, "out", False) and predicate(m):
@@ -165,6 +178,7 @@ class UserbotPool:
             request_retries=1,
             connection_retries=1,
             auto_reconnect=False,
+            receive_updates=False,
             raise_last_call_error=is_mem,
         )
 

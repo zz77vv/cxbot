@@ -161,7 +161,7 @@ async def test_jr_manual_verify_fallback_does_not_block_global_rpc_semaphore(tmp
         admin_release = asyncio.Event()
         manual = ManualVerifyManager(cfg)
 
-        async def _fake_ask(phone, image_bytes, labels, timeout=120.0):
+        async def _fake_ask(phone, image_bytes, labels, **kwargs):
             admin_waiting.set()
             await admin_release.wait()
             return 1  # 选择"乙"

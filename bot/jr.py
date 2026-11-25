@@ -1,4 +1,4 @@
-"""巨人 (@jrsgk) 查询全流程：缓存 → 选号/冷却 → 自动OCR+人工验证 → 购买 → 导出优先+翻页降级。"""
+"""巨人 (@jrsgk) 查询全流程：缓存 → 选号/冷却 → 自动OCR+多轮人工验证 → 购买 → 导出优先+翻页降级。"""
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +25,6 @@ from .targets import (
     JR,
     JR_BUY_AMOUNTS,
     JR_EXPORT_KEYWORDS,
-    JR_EXPORT_SUCCESS_KEYWORDS,
     JR_FREE_COOLDOWN_SECONDS,
     JR_FREE_DAILY_LIMIT,
     JR_FREE_EXPORT_KEYWORDS,
@@ -46,6 +45,7 @@ from .userbots import (
     msg_signature,
     wait_reply,
 )
+from .utils import KeyedLocks, utf16_len
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,8 @@ JR_HEADER_RE = re.compile(
 _PAGE_LINE_RE = re.compile(r"^\s*[(（]?\s*" + JR_PAGE_RE.pattern + r"\s*[)）]?\s*[:：]?\s*$", re.I)
 _COOLDOWN_RE = re.compile(r"查询过于频繁[，,]\s*请\s*(\d{1,6})\s*秒后再试")
 ACCOUNT_WAIT_TIMEOUT = 180.0
+MEMBERSHIP_RECHECK_INTERVAL = 86400.0
+MANUAL_VERIFY_MAX_ATTEMPTS = 3
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -72,6 +74,7 @@ class JRResult:
     reason: str = ""
     from_cache: bool = False
     partial: bool = False
+    fatal_batch: bool = False  # 全局限流或所有账号不可用，批量应立即中止
 
 
 # ---------------- 纯函数解析器 ----------------
@@ -263,7 +266,16 @@ class ManualVerifyManager:
         fut.set_result(idx)
         await query.answer("已收到选择，正在提交…")
 
-    async def ask_admin(self, phone: str, image_bytes: bytes, labels: list[str], timeout: float = 120.0) -> int:
+    async def ask_admin(
+        self,
+        phone: str,
+        image_bytes: bytes,
+        labels: list[str],
+        *,
+        attempt: int = 1,
+        max_attempts: int = MANUAL_VERIFY_MAX_ATTEMPTS,
+        timeout: float = 120.0,
+    ) -> int:
         if self.bot is None:
             raise RuntimeError("bot_not_ready")
         token = secrets.token_urlsafe(12)
@@ -273,7 +285,8 @@ class ManualVerifyManager:
             [InlineKeyboardButton(label, callback_data=f"jrverify:{token}:{i}")]
             for i, label in enumerate(labels)
         ])
-        caption = f"🔐 巨人安全验证（协议号尾号 {phone[-4:]}）\n自动识别未通过，请按原图点击对应选项（限时 {int(timeout)} 秒）："
+        prefix = "自动识别未通过" if attempt == 1 else f"上次未通过，已刷新验证图（第 {attempt}/{max_attempts} 次）"
+        caption = f"🔐 巨人安全验证（协议号尾号 {phone[-4:]}）\n{prefix}，请按原图点击对应选项（限时 {int(timeout)} 秒）："
         prompt = None
         try:
             prompt = await asyncio.wait_for(
@@ -311,16 +324,9 @@ class JRService:
         self.balances = balances
         self.ocr = ocr
         self.manual_verify = manual_verify
-        self._query_locks: dict[str, asyncio.Lock] = {}
+        self._query_locks = KeyedLocks()
 
-    def _get_query_lock(self, key: str) -> asyncio.Lock:
-        lock = self._query_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._query_locks[key] = lock
-        return lock
-
-    async def _save_text_file(self, text: str, filename: str) -> Path:
+    async def _save_text_file(self, text: str) -> Path:
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
         out_dir = self.cfg.cache_dir / uuid.uuid4().hex
         out_dir.mkdir(parents=True, exist_ok=False)
@@ -344,16 +350,16 @@ class JRService:
             raise FileNotFoundError("下载结果文件失败")
         return actual, name
 
-    async def _pick_account(self, on_progress: ProgressCallback | None) -> tuple[Account | None, str]:
-        """按积分降序选号；若全在冷却/忙碌则等待最早到期（最多 180 秒）。"""
+    async def _pick_account(self, on_progress: ProgressCallback | None) -> tuple[Account | None, str, bool]:
+        """按积分降序选号；返回 (account, error_reason, fatal_batch)。"""
         deadline = time.monotonic() + ACCOUNT_WAIT_TIMEOUT
         while True:
             if self.pool.any_flood_active():
-                return None, "存在账号触发电报限流，已暂停巨人调度，请稍后再试。"
+                return None, "存在账号触发电报限流，已暂停巨人调度，请稍后再试。", True
 
             accounts = tuple(self.pool.accounts.values())
             if not accounts:
-                return None, "尚未登录任何协议号，请先使用 /login 登录。"
+                return None, "尚未登录任何协议号，请先使用 /login 登录。", True
 
             meta_map = await self.db.all_account_meta()
             now = time.time()
@@ -389,13 +395,13 @@ class JRService:
                     *(self.balances.query(acc, JR, use_cache=True) for acc in candidates)
                 )
                 if any(r.rate_limited for r in bal_results):
-                    return None, "查询积分时触发电报限流，已停止调度。"
+                    return None, "查询积分时触发电报限流，已停止调度。", True
                 ranked = sorted(
                     ((acc, r.value) for acc, r in zip(candidates, bal_results) if r.ok and r.value is not None),
                     key=lambda item: -item[1],
                 )
                 if ranked:
-                    return ranked[0][0], ""
+                    return ranked[0][0], "", False
                 reasons.add("积分查询失败")
 
             if earliest_retry and time.monotonic() < deadline:
@@ -406,14 +412,33 @@ class JRService:
                 continue
 
             detail = "、".join(sorted(reasons)) or "无可用账号"
-            return None, f"暂无可用协议号（{detail}）。"
+            fatal = not earliest_retry  # 并非临时等待超时，而是确实全部无额度或离线
+            return None, f"暂无可用协议号（{detail}）。", fatal
+
+    async def _resubmit_after_verify(self, client, account: Account, original_query: str):
+        meta = await self.db.get_account_meta(account.phone)
+        if meta["jr_membership"] != "member":
+            await self.db.set_jr_cooldown(account.phone, time.time() + JR_FREE_COOLDOWN_SECONDS)
+        async with self.pool.rpc_slot():
+            sent = await asyncio.wait_for(
+                client.send_message(JR.username, original_query), self.cfg.reply_timeout
+            )
+            reply = await wait_reply(
+                client,
+                JR.username,
+                sent.id,
+                lambda m: not is_pending_message(m),
+                self.cfg.reply_timeout,
+                rpc_timeout=self.cfg.reply_timeout,
+            )
+        return reply, sent.id
 
     async def _solve_verification(
         self, client, account: Account, current_msg, original_query: str, on_progress: ProgressCallback | None
     ):
-        """先尝试自动 OCR（最多 3 次），失败后无缝转管理员私聊人工点选。"""
+        """先尝试自动 OCR（最多 3 次），失败后无缝转管理员私聊人工点选（支持点错刷新重选，最多 3 次）。"""
         msg = current_msg
-        resubmitted = False
+        stage1_clicked = False
 
         # 阶段 1：自动 OCR
         for attempt in range(1, OCR_MAX_ATTEMPTS + 1):
@@ -430,6 +455,7 @@ class JRService:
                 btn_idx, _, _ = await self.ocr.recognize_captcha(img_bytes, [c.normalized for c in cands])
                 chosen = cands[btn_idx]
                 old_sig = msg_signature(msg)
+                stage1_clicked = True
                 async with self.pool.rpc_slot():
                     cb = await asyncio.wait_for(msg.click(chosen.row, chosen.col), self.cfg.reply_timeout)
                     passed = "验证通过" in (getattr(cb, "message", "") or "")
@@ -444,25 +470,13 @@ class JRService:
                         rpc_timeout=self.cfg.reply_timeout,
                     )
                 passed = passed or bool(reply and "验证通过" in (getattr(reply, "text", "") or ""))
-                if passed and not resubmitted:
-                    async with self.pool.rpc_slot():
-                        sent = await asyncio.wait_for(
-                            client.send_message(JR.username, original_query), self.cfg.reply_timeout
-                        )
-                        resubmitted = True
-                        reply = await wait_reply(
-                            client,
-                            JR.username,
-                            sent.id,
-                            lambda m: not is_pending_message(m),
-                            self.cfg.reply_timeout,
-                            rpc_timeout=self.cfg.reply_timeout,
-                        )
-                    return reply, sent.id
+                if passed:
+                    return await self._resubmit_after_verify(client, account, original_query)
                 if reply is None:
                     break
                 if classify_message(reply) == "manual":
                     msg = reply
+                    stage1_clicked = False
                     continue
                 return reply, msg.id
             except OCRError as exc:
@@ -472,68 +486,97 @@ class JRService:
                 log.warning("自动验证过程异常，回退人工验证", exc_info=exc)
                 break
 
-        # 阶段 2：回退管理员私聊人工点选（不持有 rpc_sem！）
-        cands = [
-            c
-            for c in extract_captcha_candidates(msg)
-            if isinstance(msg.buttons[c.row][c.col].button, KeyboardButtonCallback)
-            and not getattr(msg.buttons[c.row][c.col].button, "requires_password", False)
-        ]
-        if not cands or not getattr(msg, "media", None):
-            return None, msg.id
+        # 若阶段 1 已点击过但未拿到新验证消息，先拉取原消息确认是否仍有效，避免发过期旧图给管理员
+        if stage1_clicked:
+            try:
+                async with self.pool.rpc_slot():
+                    refreshed = await asyncio.wait_for(
+                        client.get_messages(JR.username, ids=msg.id), self.cfg.reply_timeout
+                    )
+                if not refreshed or classify_message(refreshed) != "manual":
+                    return None, msg.id
+                msg = refreshed
+            except Exception:
+                return None, msg.id
 
-        if on_progress:
-            await on_progress("🔐 自动识别未通过，已发送验证码图片到私聊，请在 2 分钟内点击选择…")
+        # 阶段 2：管理员私聊人工点选（不占全局 rpc_sem；点错刷新新图时自动继续下一轮，最多 3 次）
+        for manual_attempt in range(1, MANUAL_VERIFY_MAX_ATTEMPTS + 1):
+            cands = [
+                c
+                for c in extract_captcha_candidates(msg)
+                if isinstance(msg.buttons[c.row][c.col].button, KeyboardButtonCallback)
+                and not getattr(msg.buttons[c.row][c.col].button, "requires_password", False)
+            ]
+            if not cands or not getattr(msg, "media", None):
+                return None, msg.id
 
-        async with self.pool.rpc_slot():
-            img_bytes = await asyncio.wait_for(
-                client.download_media(msg, file=bytes), self.cfg.reply_timeout
-            )
-        if not img_bytes:
-            return None, msg.id
+            if on_progress:
+                if manual_attempt == 1:
+                    await on_progress("🔐 自动识别未通过，已发送验证码图片到私聊，请在 2 分钟内点击选择…")
+                else:
+                    await on_progress(
+                        f"🔐 上次未通过，巨人已发新验证图，请到私聊重新点击（第 {manual_attempt}/{MANUAL_VERIFY_MAX_ATTEMPTS} 次）…"
+                    )
 
-        old_sig = msg_signature(msg)
-        # 注意：此处等待管理员点击，完全不占用 pool.rpc_sem
-        selected = await self.manual_verify.ask_admin(account.phone, img_bytes, [c.label for c in cands])
-        chosen = cands[selected]
-
-        async with self.pool.rpc_slot():
-            cb = await asyncio.wait_for(msg.click(chosen.row, chosen.col), self.cfg.reply_timeout)
-            passed = "验证通过" in (getattr(cb, "message", "") or "")
-            if not passed:
-                reply = await wait_reply(
-                    client,
-                    JR.username,
-                    msg.id,
-                    lambda m: not is_pending_message(m),
-                    self.cfg.reply_timeout,
-                    original=msg,
-                    old_sig=old_sig,
-                    rpc_timeout=self.cfg.reply_timeout,
+            async with self.pool.rpc_slot():
+                img_bytes = await asyncio.wait_for(
+                    client.download_media(msg, file=bytes), self.cfg.reply_timeout
                 )
-                passed = bool(reply and "验证通过" in (getattr(reply, "text", "") or ""))
+            if not img_bytes:
+                return None, msg.id
+
+            old_sig = msg_signature(msg)
+            # 注意：此处等待管理员点击，完全不占用 pool.rpc_sem
+            selected = await self.manual_verify.ask_admin(
+                account.phone,
+                img_bytes,
+                [c.label for c in cands],
+                attempt=manual_attempt,
+                max_attempts=MANUAL_VERIFY_MAX_ATTEMPTS,
+            )
+            chosen = cands[selected]
+
+            async with self.pool.rpc_slot():
+                cb = await asyncio.wait_for(msg.click(chosen.row, chosen.col), self.cfg.reply_timeout)
+                passed = "验证通过" in (getattr(cb, "message", "") or "")
+                reply = None
                 if not passed:
-                    return reply, msg.id
+                    reply = await wait_reply(
+                        client,
+                        JR.username,
+                        msg.id,
+                        lambda m: not is_pending_message(m),
+                        self.cfg.reply_timeout,
+                        original=msg,
+                        old_sig=old_sig,
+                        rpc_timeout=self.cfg.reply_timeout,
+                    )
+                    passed = bool(reply and "验证通过" in (getattr(reply, "text", "") or ""))
 
-            sent = await asyncio.wait_for(
-                client.send_message(JR.username, original_query), self.cfg.reply_timeout
-            )
-            reply = await wait_reply(
-                client,
-                JR.username,
-                sent.id,
-                lambda m: not is_pending_message(m),
-                self.cfg.reply_timeout,
-                rpc_timeout=self.cfg.reply_timeout,
-            )
-            return reply, sent.id
+            if passed:
+                return await self._resubmit_after_verify(client, account, original_query)
 
-    async def _try_export(self, client, account: Account, reply_msg, after_id: int) -> tuple[JRResult | None, str]:
-        """优先尝试导出文件，并顺便识别会员/免费身份。返回 (JRResult|None, membership_detected)。"""
+            # 点错后巨人发来新的验证图 -> 自动进入下一轮推送新图给管理员！
+            if reply is not None and classify_message(reply) == "manual":
+                msg = reply
+                continue
+            return reply, msg.id
+
+        return None, msg.id
+
+    async def _try_export(
+        self, client, account: Account, meta: dict, reply_msg, after_id: int
+    ) -> tuple[JRResult | None, str]:
+        """优先尝试导出文件，并识别会员/免费身份；24 小时内已知 free 的账号直接跳过按钮点击。"""
         if getattr(reply_msg, "document", None):
             path, name = await self._download_document(client, reply_msg)
             await self.db.set_jr_membership(account.phone, "member")
             return JRResult(ok=True, kind="file", file_path=str(path), file_name=name), "member"
+
+        # 已确认为 free 且距离上次检测未满 24 小时，直接跳过导出按钮点击，省时防频控
+        checked_at = float(meta.get("jr_membership_checked_at") or 0.0)
+        if meta.get("jr_membership") == "free" and (time.time() - checked_at) < MEMBERSHIP_RECHECK_INTERVAL:
+            return None, "free"
 
         btn = find_button(reply_msg, JR_EXPORT_KEYWORDS)
         if not btn:
@@ -583,23 +626,34 @@ class JRService:
 
     async def _collect_pages(
         self, client, first_msg, on_progress: ProgressCallback | None
-    ) -> tuple[str, int, bool, bool]:
-        """本地翻页收集（最多 200 页），返回 (merged_text, page_count, is_paginated, timed_out)。"""
+    ) -> tuple[str, int, int | None, bool, bool]:
+        """本地翻页收集（最多 200 页），返回 (merged_text, page_count, total_pages, is_paginated, incomplete)。"""
         pages: list[str] = []
         seen_sigs: set[tuple] = set()
         current = first_msg
         first_info = parse_page_info(first_msg)
+        expected_total: int | None = first_info[1] if first_info else None
         paginated = bool((first_info and first_info[1] > 1) or find_next_page_button(first_msg))
-        timed_out = False
+        incomplete = False
+        last_page_num = 0
 
         for page_idx in range(1, JR_MAX_PAGES + 1):
-            sig = (parse_page_info(current), clean_page_text(current))
+            info = parse_page_info(current)
+            if info:
+                if expected_total is None:
+                    expected_total = info[1]
+                if info[0] <= last_page_num:
+                    incomplete = True
+                    break
+                last_page_num = info[0]
+
+            sig = (info, clean_page_text(current))
             if sig in seen_sigs:
+                incomplete = True
                 break
             seen_sigs.add(sig)
             pages.append(clean_page_text(current))
 
-            info = parse_page_info(current)
             if on_progress and paginated:
                 if info:
                     await on_progress(f"📄 正在收集结果：第 {info[0]}/{info[1]} 页…")
@@ -609,7 +663,12 @@ class JRService:
             if info and info[0] >= info[1]:
                 break
             nxt = find_next_page_button(current)
-            if not nxt or page_idx == JR_MAX_PAGES:
+            if not nxt:
+                if expected_total is not None and len(pages) < expected_total:
+                    incomplete = True
+                break
+            if page_idx == JR_MAX_PAGES:
+                incomplete = True
                 break
 
             r, c, _ = nxt
@@ -630,17 +689,17 @@ class JRService:
             except TimeoutError:
                 changed = None
 
-            if changed is None:
-                timed_out = True
-                break
-            if classify_message(changed) != "result":
-                timed_out = True
+            if changed is None or classify_message(changed) != "result":
+                incomplete = True
                 break
             current = changed
             await asyncio.sleep(JR_PAGE_INTERVAL)
 
+        if expected_total is not None and len(pages) < expected_total:
+            incomplete = True
+
         merged = normalize_full_text("\n\n".join(p for p in pages if p))
-        return merged, len(pages), paginated, timed_out
+        return merged, len(pages), expected_total, paginated, incomplete
 
     async def query(self, text: str, *, on_progress: ProgressCallback | None = None) -> JRResult:
         text = (text or "").strip()
@@ -648,8 +707,7 @@ class JRService:
             return JRResult(ok=False, kind="error", reason="查询内容不能为空。")
 
         cache_key = make_cache_key("jr", text)
-        qlock = self._get_query_lock(cache_key)
-        async with qlock:
+        async with self._query_locks.hold(cache_key):
             # 1. 查缓存
             cached = await self.db.get_cache(cache_key)
             if cached is not None:
@@ -665,13 +723,14 @@ class JRService:
                 elif cached.text:
                     return JRResult(ok=True, kind="text", text=cached.text, from_cache=True)
 
-            # 2. 选号并执行（若遇冷却拒绝则自动换号重试）
-            while True:
+            # 2. 选号并执行（有界换号重试，避免死循环）
+            max_attempts = max(len(self.pool.accounts) * 2, 5)
+            for _ in range(max_attempts):
                 if on_progress:
                     await on_progress("🔎 正在选择可用协议号…")
-                account, err = await self._pick_account(on_progress)
+                account, err, fatal = await self._pick_account(on_progress)
                 if account is None:
-                    return JRResult(ok=False, kind="error", reason=err)
+                    return JRResult(ok=False, kind="error", reason=err, fatal_batch=fatal)
 
                 try:
                     async with self.pool.hold_account(account, wait=False) as client:
@@ -711,8 +770,10 @@ class JRService:
                             except TimeoutError:
                                 return JRResult(ok=False, kind="error", reason="人工验证超时，本次查询已取消。")
                             if reply is None:
-                                return JRResult(ok=False, kind="error", reason="安全验证未完成，本次查询已取消。")
+                                return JRResult(ok=False, kind="error", reason="安全验证未通过或已取消，请稍后重试。")
                             kind = classify_message(reply)
+                            if kind == "manual":
+                                return JRResult(ok=False, kind="error", reason="安全验证多次未通过，本次查询已取消。")
 
                         if kind == "cooldown":
                             cd_sec = parse_cooldown_seconds(reply) or JR_FREE_COOLDOWN_SECONDS
@@ -753,10 +814,10 @@ class JRService:
                             if reply is None or classify_message(reply) != "result" or find_buy_button(reply):
                                 return JRResult(ok=False, kind="error", reason="购买后未收到确认结果，请核对上游记录。")
 
-                        # 4. 优先尝试「导出数据」，失败或免费号无缝降级本地翻页
+                        # 4. 优先尝试「导出数据」，失败或已知免费号无缝降级本地翻页
                         if on_progress:
-                            await on_progress("📥 正在获取完整结果（优先尝试导出）…")
-                        exported, _ = await self._try_export(client, account, reply, after_id)
+                            await on_progress("📥 正在获取完整结果…")
+                        exported, _ = await self._try_export(client, account, meta, reply, after_id)
                         if exported is not None:
                             await self.db.inc_jr_daily_usage(account.phone)
                             self.balances.invalidate(account.phone, JR.key)
@@ -767,7 +828,7 @@ class JRService:
                             )
                             return exported
 
-                        merged, page_count, paginated, timed_out = await self._collect_pages(
+                        merged, page_count, total_pages, paginated, incomplete = await self._collect_pages(
                             client, reply, on_progress
                         )
                         if not merged:
@@ -776,24 +837,27 @@ class JRService:
                         await self.db.inc_jr_daily_usage(account.phone)
                         self.balances.invalidate(account.phone, JR.key)
 
-                        # 多页、超长或部分超时结果导出为 TXT 文件
-                        need_file = paginated or timed_out or len(merged) > 3500
+                        need_file = paginated or incomplete or utf16_len(merged) > 3500
                         if need_file:
-                            fname = "巨人查询部分结果.txt" if timed_out else "巨人查询结果.txt"
-                            body = (
-                                f"部分结果（翻页超时，已收集 {page_count} 页）\n\n{merged}"
-                                if timed_out
-                                else merged
-                            )
-                            path = await self._save_text_file(body, fname)
+                            fname = "巨人查询部分结果.txt" if incomplete else "巨人查询结果.txt"
+                            if incomplete:
+                                count_str = (
+                                    f"已收集 {page_count}/{total_pages} 页"
+                                    if total_pages is not None
+                                    else f"已收集 {page_count} 页"
+                                )
+                                body = f"部分结果（翻页未完整，{count_str}）\n\n{merged}"
+                            else:
+                                body = merged
+                            path = await self._save_text_file(body)
                             res = JRResult(
                                 ok=True,
                                 kind="file",
                                 file_path=str(path),
                                 file_name=fname,
-                                partial=timed_out,
+                                partial=incomplete,
                             )
-                            if not timed_out:
+                            if not incomplete:
                                 await self.db.set_cache(
                                     cache_key,
                                     CachedResult("file", file_path=str(path), file_name=fname),
@@ -811,7 +875,14 @@ class JRService:
                 except AccountUnavailable:
                     continue
                 except FloodWaitError as exc:
-                    return JRResult(ok=False, kind="error", reason=f"触发电报限流，请等待 {exc.seconds} 秒后再试。")
+                    return JRResult(
+                        ok=False,
+                        kind="error",
+                        reason=f"触发电报限流，请等待 {exc.seconds} 秒后再试。",
+                        fatal_batch=True,
+                    )
                 except Exception as exc:
                     log.error("巨人查询异常", exc_info=exc)
                     return JRResult(ok=False, kind="error", reason=f"查询发生异常（{type(exc).__name__}）。")
+
+            return JRResult(ok=False, kind="error", reason="多次尝试换号仍未成功，请稍后再试。")

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     flood_until REAL NOT NULL DEFAULT 0,
     jr_cooldown_until REAL NOT NULL DEFAULT 0,
     jr_membership TEXT NOT NULL DEFAULT 'unknown' CHECK(jr_membership IN ('unknown', 'free', 'member')),
+    jr_membership_checked_at REAL NOT NULL DEFAULT 0,
     updated_at REAL NOT NULL DEFAULT 0
 );
 
@@ -72,6 +73,32 @@ class CachedResult:
     file_name: str | None = None
 
 
+def _cleanup_cache_files_sync(cache_dir: Path, active: set[Path], now: float) -> int:
+    if not cache_dir.is_dir():
+        return 0
+    deleted = 0
+    base = cache_dir.resolve()
+    for f in cache_dir.rglob("*"):
+        if f.is_symlink() or not f.is_file():
+            continue
+        try:
+            resolved = f.resolve()
+            if not resolved.is_relative_to(base):
+                continue
+            if resolved not in active and (now - f.stat().st_mtime) > 120:
+                f.unlink()
+                deleted += 1
+        except OSError:
+            pass
+    for d in sorted(cache_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if d.is_dir() and not d.is_symlink():
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+    return deleted
+
+
 class Database:
     """单连接 + 互斥事务锁的轻量级 SQLite 封装。"""
 
@@ -88,6 +115,13 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self.conn.executescript(SCHEMA_SQL)
+        # 兼容平滑补列（已有 v3 库自动补 jr_membership_checked_at）
+        async with self.conn.execute("PRAGMA table_info(accounts)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "jr_membership_checked_at" not in cols:
+            await self.conn.execute(
+                "ALTER TABLE accounts ADD COLUMN jr_membership_checked_at REAL NOT NULL DEFAULT 0"
+            )
         return self
 
     async def close(self) -> None:
@@ -130,6 +164,7 @@ class Database:
                 "flood_until": 0.0,
                 "jr_cooldown_until": 0.0,
                 "jr_membership": "unknown",
+                "jr_membership_checked_at": 0.0,
             }
         return dict(row)
 
@@ -156,14 +191,15 @@ class Database:
             if force_free:
                 await c.execute(
                     """
-                    INSERT INTO accounts(phone, jr_cooldown_until, jr_membership, updated_at)
-                    VALUES(?, ?, 'free', ?)
+                    INSERT INTO accounts(phone, jr_cooldown_until, jr_membership, jr_membership_checked_at, updated_at)
+                    VALUES(?, ?, 'free', ?, ?)
                     ON CONFLICT(phone) DO UPDATE SET
                         jr_cooldown_until = MAX(jr_cooldown_until, excluded.jr_cooldown_until),
                         jr_membership = 'free',
+                        jr_membership_checked_at = excluded.jr_membership_checked_at,
                         updated_at = excluded.updated_at
                     """,
-                    (phone, until_at, now),
+                    (phone, until_at, now, now),
                 )
             else:
                 await c.execute(
@@ -182,14 +218,15 @@ class Database:
         async with self.tx() as c:
             await c.execute(
                 """
-                INSERT INTO accounts(phone, jr_membership, jr_cooldown_until, updated_at)
-                VALUES(?, ?, ?, ?)
+                INSERT INTO accounts(phone, jr_membership, jr_membership_checked_at, jr_cooldown_until, updated_at)
+                VALUES(?, ?, ?, 0.0, ?)
                 ON CONFLICT(phone) DO UPDATE SET
                     jr_membership = excluded.jr_membership,
+                    jr_membership_checked_at = excluded.jr_membership_checked_at,
                     jr_cooldown_until = CASE WHEN excluded.jr_membership='member' THEN 0 ELSE jr_cooldown_until END,
                     updated_at = excluded.updated_at
                 """,
-                (phone, status, 0.0 if status == "member" else 0.0, now),
+                (phone, status, now, now),
             )
 
     # ---------- JR 每日用量 ----------
@@ -257,7 +294,7 @@ class Database:
                 (phone, bot_key, now, now if success else 0.0, next_at, status, int(success)),
             )
 
-    # ---------- 结果缓存 ----------
+    # ---------- 结果缓存与历史清理 ----------
 
     async def get_cache(self, cache_key: str) -> CachedResult | None:
         row = await self.fetchone(
@@ -292,33 +329,13 @@ class Database:
 
     async def purge_expired_cache(self, cache_dir: Path) -> int:
         now = time.time()
+        cutoff_day = beijing_date(now - 30 * 86400)
         async with self.tx() as c:
             await c.execute("DELETE FROM result_cache WHERE expires_at<=?", (now,))
+            await c.execute("DELETE FROM jr_usage WHERE usage_date<?", (cutoff_day,))
             async with c.execute(
                 "SELECT file_path FROM result_cache WHERE file_path IS NOT NULL"
             ) as cur:
                 active = {Path(r[0]).resolve() for r in await cur.fetchall() if r[0]}
 
-        if not cache_dir.is_dir():
-            return 0
-        deleted = 0
-        base = cache_dir.resolve()
-        for f in cache_dir.rglob("*"):
-            if f.is_symlink() or not f.is_file():
-                continue
-            resolved = f.resolve()
-            if not resolved.is_relative_to(base):
-                continue
-            if resolved not in active and (now - f.stat().st_mtime) > 120:
-                try:
-                    f.unlink()
-                    deleted += 1
-                except OSError:
-                    pass
-        for d in sorted(cache_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if d.is_dir() and not d.is_symlink():
-                try:
-                    d.rmdir()
-                except OSError:
-                    pass
-        return deleted
+        return await asyncio.to_thread(_cleanup_cache_files_sync, cache_dir, active, now)

@@ -1,10 +1,11 @@
-"""应用组装与生命周期管理（启动、后台任务托管、优雅逆序停机）。"""
+"""应用组装与生命周期管理（单实例锁、在途请求优雅排空、逆序停机）。"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import signal
 import sys
+from contextlib import asynccontextmanager
 
 from telegram.ext import Application
 
@@ -18,7 +19,9 @@ from .jr import JRService, ManualVerifyManager
 from .logging_setup import setup_logging
 from .login import LoginService
 from .ocr import OCRService
+from .targets import HW
 from .userbots import UserbotPool
+from .utils import ProcessLock
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +29,19 @@ log = logging.getLogger(__name__)
 class BotApp:
     def __init__(self, cfg: Config):
         self.cfg = cfg
+        self.process_lock = ProcessLock(cfg.database)
         self.db = Database(cfg.database)
         self.pool = UserbotPool(cfg, self.db)
         self.ocr = OCRService(timeout=cfg.ocr_timeout)
-        self.balances = BalanceService(self.pool, cache_ttl=cfg.balance_cache_ttl)
+        self.hw = HWService(cfg, self.pool)
+        self.balances = BalanceService(
+            self.pool,
+            cache_ttl=cfg.balance_cache_ttl,
+            on_balance_updated=self._on_balance_updated,
+        )
         self.checkins = CheckinService(self.pool, self.db)
         self.manual_verify = ManualVerifyManager(cfg)
         self.jr = JRService(cfg, self.db, self.pool, self.balances, self.ocr, self.manual_verify)
-        self.hw = HWService(cfg, self.pool)
         self.login = LoginService(cfg, self.pool, on_enrolled=self._on_account_enrolled)
 
         self.application = (
@@ -46,11 +54,29 @@ class BotApp:
             .build()
         )
         self.manual_verify.bot = self.application.bot
-        register_handlers(self.application, self)
 
+        self.accepting = True
+        self.active_requests: set[asyncio.Task] = set()
         self.stop_event = asyncio.Event()
         self._bg_tasks: set[asyncio.Task] = set()
         self._initialized = False
+
+        register_handlers(self.application, self)
+
+    @asynccontextmanager
+    async def track_request(self):
+        task = asyncio.current_task()
+        if task is not None:
+            self.active_requests.add(task)
+        try:
+            yield
+        finally:
+            if task is not None:
+                self.active_requests.discard(task)
+
+    def _on_balance_updated(self, phone: str, bot_key: str, value: int) -> None:
+        if bot_key == HW.key and value > 0:
+            self.hw.clear_insufficient(phone)
 
     def _spawn(self, coro, *, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)
@@ -72,6 +98,7 @@ class BotApp:
                 log.warning("清理过期缓存失败", exc_info=exc)
 
     async def run(self) -> None:
+        self.process_lock.acquire()
         log_handler = setup_logging(self.cfg)
         try:
             await self.db.open()
@@ -103,19 +130,39 @@ class BotApp:
                     loop.remove_signal_handler(sig)
         finally:
             await self.close()
+            self.process_lock.close()
             logging.getLogger().removeHandler(log_handler)
             log_handler.close()
 
     async def close(self) -> None:
+        # 1. 停止接收新请求并停止轮询
+        self.accepting = False
+        if self._initialized and self.application.updater and self.application.updater.running:
+            try:
+                await asyncio.wait_for(self.application.updater.stop(), self.cfg.shutdown_timeout)
+            except Exception as exc:
+                log.warning("停止轮询异常", exc_info=exc)
+
+        # 2. 等待在途查询/签到请求自然结束，避免直接断库导致中断
+        in_flight = tuple(self.active_requests)
+        if in_flight:
+            log.info("等待 %d 个在途请求完成…", len(in_flight))
+            _, pending = await asyncio.wait(in_flight, timeout=self.cfg.shutdown_timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        # 3. 取消后台循环任务
         self.pool.stopping = True
         for task in tuple(self._bg_tasks):
             task.cancel()
         if self._bg_tasks:
             await asyncio.gather(*tuple(self._bg_tasks), return_exceptions=True)
 
+        # 4. 关闭 Bot 与底层资源
         if self._initialized:
             for step in (
-                lambda: self.application.updater.stop() if self.application.updater.running else asyncio.sleep(0),
                 lambda: self.application.stop() if self.application.running else asyncio.sleep(0),
                 self.application.shutdown,
             ):

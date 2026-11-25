@@ -87,28 +87,30 @@ class CheckinService:
         return CheckinResult("timeout", "等待签到确认超时")
 
     async def run_one(self, account: Account, target: TargetBot) -> CheckinResult:
-        now = time.time()
-        row = await self.db.init_checkin(
-            account.phone, target.key, now + self.rng.uniform(0, CHECKIN_MIN_INTERVAL)
-        )
-        last = max(row["last_attempt_at"], row["last_success_at"])
-        if last and now < last + CHECKIN_MIN_INTERVAL:
-            return CheckinResult("skipped", "24小时内已尝试")
-
         try:
-            async with self.pool.use(account) as client:
-                try:
-                    res = await self._perform(client, target)
-                except FloodWaitError as exc:
-                    await self.pool.mark_flood_wait(account, exc.seconds)
-                    res = CheckinResult("rate_limited", f"限流({exc.seconds}s)")
-                except TimeoutError:
-                    res = CheckinResult("timeout", "通信超时")
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.warning("签到异常 phone=%s target=%s", account.phone, target.name, exc_info=exc)
-                    res = CheckinResult("failed", type(exc).__name__)
+            async with self.pool.hold_account(account) as client:
+                # 24 小时检查放在账号锁内，杜绝定时调度与 /qd 并发撞车双签
+                now = time.time()
+                row = await self.db.init_checkin(
+                    account.phone, target.key, now + self.rng.uniform(0, CHECKIN_MIN_INTERVAL)
+                )
+                last = max(row["last_attempt_at"], row["last_success_at"])
+                if last and now < last + CHECKIN_MIN_INTERVAL:
+                    return CheckinResult("skipped", "24小时内已尝试")
+
+                async with self.pool.rpc_slot():
+                    try:
+                        res = await self._perform(client, target)
+                    except FloodWaitError as exc:
+                        await self.pool.mark_flood_wait(account, exc.seconds)
+                        res = CheckinResult("rate_limited", f"限流({exc.seconds}s)")
+                    except TimeoutError:
+                        res = CheckinResult("timeout", "通信超时")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning("签到异常 phone=%s target=%s", account.phone, target.name, exc_info=exc)
+                        res = CheckinResult("failed", type(exc).__name__)
         except AccountUnavailable:
             return CheckinResult("unavailable", "账号不可用")
 
@@ -155,9 +157,14 @@ class CheckinService:
                 delay = max(0.0, row["next_at"] - time.time())
                 await asyncio.sleep(delay)
                 res = await self.run_one(account, target)
-                if res.status in ("unavailable", "skipped"):
+                if res.status == "unavailable":
                     wait_s = max(60.0, min(600.0, account.flood_until - time.time()))
                     await asyncio.sleep(wait_s)
+                elif res.status == "skipped":
+                    latest = await self.db.get_checkin(account.phone, target.key)
+                    last = max(latest["last_attempt_at"], latest["last_success_at"]) if latest else 0.0
+                    remain = (last + CHECKIN_MIN_INTERVAL) - time.time()
+                    await asyncio.sleep(max(60.0, min(3600.0, remain)))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
