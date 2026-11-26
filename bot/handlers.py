@@ -248,7 +248,7 @@ def register_handlers(application: Application, app) -> None:
 
             summary = await msg.reply_text(f"📦 巨人批量查询：共 {len(lines)} 条（已去重），逐条执行…")
             summary_ed = ProgressEditor(summary, min_interval=1.0)
-            ok_cnt = fail_cnt = 0
+            hit_cnt = empty_cnt = fail_cnt = 0
             stopped_reason = ""
             for idx, item in enumerate(lines, 1):
                 if not app.accepting or app.pool.stopping:
@@ -262,23 +262,28 @@ def register_handlers(application: Application, app) -> None:
                 )
                 await _deliver_jr_result(chat_id, context.bot, p_ed, res)
                 if res.ok:
-                    ok_cnt += 1
+                    if res.kind == "empty":
+                        empty_cnt += 1
+                    else:
+                        hit_cnt += 1
                 else:
                     fail_cnt += 1
                     if res.fatal_batch:
                         stopped_reason = res.reason
                         break
-                await summary_ed.update(f"📦 巨人批量进度：{idx}/{len(lines)}（成功 {ok_cnt}，失败 {fail_cnt}）")
+                await summary_ed.update(
+                    f"📦 巨人批量进度：{idx}/{len(lines)}（命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}）"
+                )
 
-            remain = len(lines) - ok_cnt - fail_cnt
+            remain = len(lines) - hit_cnt - empty_cnt - fail_cnt
             if stopped_reason:
                 await summary_ed.update(
-                    f"⚠️ 巨人批量已提前暂停：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}\n原因：{stopped_reason}",
+                    f"⚠️ 巨人批量已提前暂停：命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}，未执行 {remain}\n原因：{stopped_reason}",
                     force=True,
                 )
             else:
                 await summary_ed.update(
-                    f"✅ 巨人批量完成：共 {len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）",
+                    f"✅ 巨人批量完成：共 {len(lines)} 条（命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}）",
                     force=True,
                 )
 

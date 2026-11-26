@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from telethon.tl.types import KeyboardButtonCallback
+from telethon.tl.types import KeyboardButtonCallback, KeyboardButtonUrl, MessageEntityPre
 
 from bot.balance import BalanceResult
 from bot.config import Config
@@ -178,5 +178,73 @@ async def test_jr_manual_verify_fallback_does_not_block_global_rpc_semaphore(tmp
         admin_release.set()
         res = await asyncio.wait_for(task, 5.0)
         assert res.ok and res.kind == "text" and "验证后结果" in res.text
+    finally:
+        await db.close()
+
+
+async def test_jr_three_empty_result_formats_with_pre_entity_and_url_buttons(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        url_buttons = [[
+            SimpleNamespace(text="频道", button=KeyboardButtonUrl(text="频道", url="https://t.me/a")),
+            SimpleNamespace(text="客服", button=KeyboardButtonUrl(text="客服", url="https://t.me/b")),
+        ]]
+
+        # 1. 代码块标题带 🔴抱歉,未找到相关信息 + 4个URL按钮 + 身份证6行基础信息
+        id_reply = _msg(
+            11,
+            "证件：532929200803051914\n出生: 云南省大理白族自治州云龙县\n性别: 男\n生日: 2008-03-05\n年龄: 18岁\n生肖: 子鼠",
+            buttons=url_buttons,
+        )
+        id_reply.entities = [MessageEntityPre(offset=0, length=10, language="🔴抱歉,未找到相关信息")]
+
+        # 2. 手机号3行基础信息 + URL按钮
+        phone_reply = _msg(
+            21,
+            "手机号：15356921055\n归属地：浙江 金华\n运营商：电信",
+            buttons=url_buttons,
+        )
+
+        # 3. 固定纯文本空结果
+        text_reply = _msg(31, "抱歉，未找到相关信息。")
+
+        # 4. 真实结果带 🔍共5条信息: 且正文含"未找到"不应误判为空
+        real_reply = _msg(41, "🔍共5条信息:\n姓名：张三\n备注：未找到电话")
+
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(side_effect=[
+                _msg(10, "532929200803051914", out=True),
+                _msg(20, "15356921055", out=True),
+                _msg(30, "王五", out=True),
+                _msg(40, "张三", out=True),
+            ]),
+            get_messages=AsyncMock(side_effect=[[id_reply], [phone_reply], [text_reply], [real_reply]]),
+        )
+        pool = UserbotPool(cfg, db)
+        pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        await db.set_jr_membership("10001", "member")
+        balances = SimpleNamespace(
+            query=AsyncMock(return_value=BalanceResult(ok=True, value=50)),
+            invalidate=lambda *a, **kw: None,
+        )
+        jr = JRService(cfg, db, pool, balances, SimpleNamespace(), ManualVerifyManager(cfg))
+
+        r1 = await jr.query("532929200803051914")
+        assert r1.ok and r1.kind == "empty" and r1.text == "查询空" and not r1.from_cache
+        # 二次查询命中缓存，直接返回查询空且不再发消息
+        r1_cached = await jr.query("532929200803051914")
+        assert r1_cached.ok and r1_cached.kind == "empty" and r1_cached.text == "查询空" and r1_cached.from_cache
+
+        r2 = await jr.query("15356921055")
+        assert r2.ok and r2.kind == "empty" and r2.text == "查询空"
+
+        r3 = await jr.query("王五")
+        assert r3.ok and r3.kind == "empty" and r3.text == "查询空"
+
+        r4 = await jr.query("张三")
+        assert r4.ok and r4.kind == "text" and "姓名：张三" in r4.text
+        assert client.send_message.await_count == 4
     finally:
         await db.close()

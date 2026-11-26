@@ -60,6 +60,7 @@ _COOLDOWN_RE = re.compile(r"查询过于频繁[，,]\s*请\s*(\d{1,6})\s*秒后�
 ACCOUNT_WAIT_TIMEOUT = 180.0
 MEMBERSHIP_RECHECK_INTERVAL = 86400.0
 MANUAL_VERIFY_MAX_ATTEMPTS = 3
+EMPTY_CACHE_SENTINEL = "__JR_EMPTY__"
 
 ProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -181,6 +182,35 @@ def normalize_full_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _has_functional_buttons(msg) -> bool:
+    return bool(
+        find_buy_button(msg)
+        or find_next_page_button(msg)
+        or find_button(msg, JR_EXPORT_KEYWORDS)
+    )
+
+
+def _entity_languages(msg) -> list[str]:
+    langs: list[str] = []
+    for ent in getattr(msg, "entities", None) or []:
+        lang = getattr(ent, "language", None)
+        if isinstance(lang, str) and lang.strip():
+            langs.append(lang.strip())
+    return langs
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
 def classify_message(msg) -> str:
     if parse_cooldown_seconds(msg) is not None:
         return "cooldown"
@@ -193,8 +223,6 @@ def classify_message(msg) -> str:
     text = getattr(msg, "text", "") or ""
     if any(k in text for k in ("积分不足", "余额不足", "查询失败")):
         return "failed"
-    if any(k in text for k in ("未查询到", "未找到", "无查询结果")):
-        return "result"
     if (
         find_buy_button(msg)
         or parse_page_info(msg)
@@ -203,26 +231,38 @@ def classify_message(msg) -> str:
         or parse_header(msg)
     ):
         return "result"
+    raw_text = getattr(msg, "raw_text", None) or ""
+    candidates = [text, raw_text, *_entity_languages(msg)]
+    empty_keywords = ("未找到相关信息", "未查询到", "未找到", "无查询结果")
+    if any(k in item for item in candidates for k in empty_keywords):
+        return "empty"
     return "unknown"
 
 
-def is_basic_info_only(msg, query: str) -> bool:
-    if any(getattr(msg, attr, None) for attr in ("buttons", "media", "document", "file")):
-        return False
-    q = query.strip().upper()
-    if not re.fullmatch(r"[0-9]{17}[0-9X]", q):
-        return False
-    labels = ("证件", "出生", "性别", "生日", "年龄", "生肖")
-    lines = [ln for ln in (getattr(msg, "text", "") or "").splitlines() if ln.strip()]
+def _match_kv_lines(text: str, labels: tuple[str, ...], first_expected: str) -> bool:
+    lines = [ln for ln in _strip_code_fence(text).splitlines() if ln.strip()]
     if len(lines) != len(labels):
         return False
-    for expected, line in zip(labels, lines):
+    for idx, (expected, line) in enumerate(zip(labels, lines)):
         name, sep, val = line.replace("：", ":").partition(":")
         if not sep or name.strip() != expected or ":" in val:
             return False
-        if expected == "证件" and val.strip().upper() != q:
+        if idx == 0 and val.strip().upper() != first_expected:
             return False
     return True
+
+
+def is_basic_info_only(msg, query: str) -> bool:
+    """识别巨人仅返回身份证基础信息或手机号归属地信息（允许存在广告跳转 URL 按钮）。"""
+    if any(getattr(msg, attr, None) for attr in ("media", "document", "file")) or _has_functional_buttons(msg):
+        return False
+    text = getattr(msg, "raw_text", None) or getattr(msg, "text", "") or ""
+    q = query.strip().upper()
+    if re.fullmatch(r"[0-9]{17}[0-9X]", q):
+        return _match_kv_lines(text, ("证件", "出生", "性别", "生日", "年龄", "生肖"), q)
+    if re.fullmatch(r"1[3-9][0-9]{9}", q):
+        return _match_kv_lines(text, ("手机号", "归属地", "运营商"), q)
+    return False
 
 
 def safe_filename(msg, default_prefix: str = "巨人导出") -> str:
@@ -720,6 +760,8 @@ class JRService:
                             file_name=cached.file_name or "巨人查询结果.txt",
                             from_cache=True,
                         )
+                elif cached.text == EMPTY_CACHE_SENTINEL:
+                    return JRResult(ok=True, kind="empty", text="查询空", from_cache=True)
                 elif cached.text:
                     return JRResult(ok=True, kind="text", text=cached.text, from_cache=True)
 
@@ -788,9 +830,15 @@ class JRService:
                             self.balances.invalidate(account.phone, JR.key)
                             return JRResult(ok=False, kind="error", reason="巨人返回查询失败或积分不足。")
 
+                        if kind == "empty" or (kind != "result" and is_basic_info_only(reply, text)):
+                            await self.db.set_cache(
+                                cache_key,
+                                CachedResult("text", text=EMPTY_CACHE_SENTINEL),
+                                self.cfg.result_cache_ttl,
+                            )
+                            return JRResult(ok=True, kind="empty", text="查询空")
+
                         if kind != "result":
-                            if is_basic_info_only(reply, text):
-                                return JRResult(ok=True, kind="empty", text="查询空")
                             return JRResult(ok=False, kind="error", reason="无法识别巨人回复内容，请稍后重试。")
 
                         # 3. 付费购买确认
