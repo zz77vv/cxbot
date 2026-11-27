@@ -12,7 +12,7 @@ from bot.config import Config
 from bot.db import Database
 from bot.targets import ZHONGHY
 from bot.userbots import Account, AccountState, UserbotPool
-from bot.zhy import ZHYService, parse_3ys_args
+from bot.zhy import ZHYResult, ZHYService, format_3ys_batch_summary, parse_3ys_args, parse_3ys_batch
 
 
 def _cfg(tmp_path: Path) -> Config:
@@ -156,5 +156,58 @@ async def test_zhy_auto_switches_account_when_coins_insufficient(tmp_path):
         # 刷新余额后可解除冷却
         svc.clear_insufficient("10001")
         assert not svc._is_in_insufficient_cooldown("10001")
+    finally:
+        await db.close()
+
+
+def test_parse_3ys_batch_dedup_and_error_report():
+    items, errs = parse_3ys_batch(
+        "张三 53292920080305191x 15356921055\n"
+        "\n"
+        "张三 53292920080305191X 15356921055\n"
+        "李四 130503670401001 13800138000"
+    )
+    assert errs == []
+    assert items == [
+        ("张三", "53292920080305191X", "15356921055"),
+        ("李四", "130503670401001", "13800138000"),
+    ]
+
+    bad_items, bad_errs = parse_3ys_batch(
+        "张三 532929200803051914 15356921055\n"
+        "李四 bad_id 123"
+    )
+    assert len(bad_items) == 1
+    assert len(bad_errs) == 1 and bad_errs[0].startswith("第 2 行：")
+
+
+def test_format_3ys_batch_summary():
+    entries = [
+        (("张三", "532929200803051914", "15356921055"), ZHYResult(ok=True, text="🟢 一致")),
+        (("李四", "130503670401001", "13800138000"), ZHYResult(ok=False, reason="金币不足")),
+    ]
+    text = format_3ys_batch_summary(entries, total=3, stopped_reason="金币不足")
+    assert "成功 1，失败 1，未执行 1" in text
+    assert "原因：金币不足" in text
+    assert "【1】张三 532929200803051914 15356921055\n🟢 一致" in text
+    assert "【2】李四 130503670401001 13800138000\n❌ 失败：金币不足" in text
+
+
+async def test_zhy_fatal_batch_flag_on_all_insufficient(tmp_path):
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        menu = _msg(2, "您的金币 💲：0", buttons=[[_btn("旧三要素核验")]])
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(return_value=_msg(1, "/start", out=True)),
+            get_messages=AsyncMock(return_value=[menu]),
+        )
+        pool = UserbotPool(cfg, db)
+        pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        svc = ZHYService(cfg, pool, BalanceService(pool, cache_ttl=60))
+
+        res = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
+        assert not res.ok and res.fatal_batch
     finally:
         await db.close()

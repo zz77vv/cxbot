@@ -46,6 +46,7 @@ class ZHYResult:
     text: str = ""
     reason: str = ""
     phone: str = ""
+    fatal_batch: bool = False
 
 
 def parse_3ys_args(raw: str) -> tuple[tuple[str, str, str] | None, str]:
@@ -61,6 +62,50 @@ def parse_3ys_args(raw: str) -> tuple[tuple[str, str, str] | None, str]:
     if not PHONE_RE.fullmatch(phone):
         return None, "手机号格式不正确（需 11 位中国大陆手机号）。"
     return (name, id_card, phone), ""
+
+
+def parse_3ys_batch(raw: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """解析多行 `/3ys` 输入，返回 (去重后合法条目, 错误行说明列表)。"""
+    items: list[tuple[str, str, str]] = []
+    errors: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for line_no, line in enumerate((raw or "").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parsed, err = parse_3ys_args(stripped)
+        if not parsed:
+            errors.append(f"第 {line_no} 行：{err}")
+            continue
+        if parsed not in seen:
+            seen.add(parsed)
+            items.append(parsed)
+    return items, errors
+
+
+def format_3ys_batch_summary(
+    entries: list[tuple[tuple[str, str, str], ZHYResult]],
+    *,
+    total: int,
+    stopped_reason: str = "",
+) -> str:
+    """将批量核验结果整理为汇总报告。"""
+    ok_cnt = sum(1 for _, r in entries if r.ok)
+    fail_cnt = len(entries) - ok_cnt
+    remain = max(0, total - len(entries))
+    if stopped_reason:
+        header = (
+            f"⚠️ 旧三要素批量核验提前暂停（成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}）\n"
+            f"原因：{stopped_reason}"
+        )
+    else:
+        header = f"📋 旧三要素批量核验汇总（共 {total} 条：成功 {ok_cnt}，失败 {fail_cnt}）"
+
+    blocks = [header]
+    for idx, ((name, id_card, phone), res) in enumerate(entries, 1):
+        body = res.text if res.ok else f"❌ 失败：{res.reason}"
+        blocks.append(f"【{idx}】{name} {id_card} {phone}\n{body}")
+    return "\n\n".join(blocks)
 
 
 def is_zhy_insufficient(text: str) -> bool:
@@ -247,7 +292,7 @@ class ZHYService:
         except AccountUnavailable:
             return None, True
         except FloodWaitError as exc:
-            return ZHYResult(ok=False, reason=f"触发电报限流({exc.seconds}s)。"), False
+            return ZHYResult(ok=False, reason=f"触发电报限流({exc.seconds}s)。", fatal_batch=True), False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -272,7 +317,7 @@ class ZHYService:
                 if acc.state == AccountState.ONLINE and not acc.lock.locked()
             ]
             if not online:
-                return ZHYResult(ok=False, reason="当前没有在线空闲的协议号。")
+                return ZHYResult(ok=False, reason="当前没有在线空闲的协议号。", fatal_batch=True)
 
             candidates, all_insufficient = self._pick_candidates(online)
             if not candidates:
@@ -281,7 +326,7 @@ class ZHYService:
                     if all_insufficient
                     else "当前没有可用的在线协议号。"
                 )
-                return ZHYResult(ok=False, reason=msg)
+                return ZHYResult(ok=False, reason=msg, fatal_batch=True)
 
             skipped_count = 0
             for acc in candidates:
@@ -296,5 +341,9 @@ class ZHYService:
                         await on_progress(f"⚠️ 尾号 {acc.phone[-4:]} 金币不足或暂忙，自动尝试下一个协议号…")
 
             if skipped_count:
-                return ZHYResult(ok=False, reason="所有可用协议号中核验金币不足或暂不可用。")
-            return ZHYResult(ok=False, reason="未能找到可用协议号执行旧三要素核验。")
+                return ZHYResult(
+                    ok=False,
+                    reason="所有可用协议号中核验金币不足或暂不可用。",
+                    fatal_batch=True,
+                )
+            return ZHYResult(ok=False, reason="未能找到可用协议号执行旧三要素核验。", fatal_batch=True)
