@@ -52,6 +52,11 @@ class BalanceService:
             return BalanceResult(ok=True, value=cached[0], reason="cached")
         return None
 
+    def peek_cached(self, phone: str, bot_key: str) -> int | None:
+        """只读获取未过期的缓存余额，未命中返回 None。"""
+        hit = self._get_cached((phone, bot_key))
+        return hit.value if hit is not None else None
+
     async def query(
         self, account: Account, target: TargetBot, *, use_cache: bool = False
     ) -> BalanceResult:

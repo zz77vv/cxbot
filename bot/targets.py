@@ -26,7 +26,7 @@ ZHONGHY = TargetBot(
     username="@zhonghybot",
     checkin_cmd="/start",
     balance_cmd="/start",
-    balance_pattern=r"金币[🪙]?\s*[:：]\s*(\d+)",
+    balance_pattern=r"金币[^\d\n]{0,6}[:：]\s*(\d+)",
     checkin_buttons=("获得金币", "签到"),
     checkin_success_keywords=("签到成功", "获得", "当前金币", "金币"),
 )
@@ -73,3 +73,10 @@ OCR_IGNORE_BUTTON_KEYWORDS = (
     "刷新", "换一张", "看不清", "取消", "返回", "关闭",
     "购买", "首页", "上一页", "下一页", "尾页", "导出",
 )
+
+ZHY_OLD_3YS_BUTTON = ("旧三要素核验",)
+ZHY_OLD_3YS_COST = 1
+ZHY_PENDING_KEYWORDS = ("核验中", "请稍候", "请稍等", "查询中")
+ZHY_INSUFFICIENT_KEYWORDS = ("金币不足", "余额不足", "积分不足")
+ZHY_MENU_TIMEOUT = 20.0
+ZHY_RESULT_TIMEOUT = 60.0

@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from .targets import JR_FREE_DAILY_LIMIT, TARGETS
 from .utils import ProgressEditor, split_text
+from .zhy import parse_3ys_args
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,7 @@ COMMANDS = {
     "help": "显示使用帮助",
     "jr": "巨人查询（支持 /jr+内容 与多行批量）",
     "hw": "核武器私聊查询（支持多行批量）",
+    "3ys": "中核验旧三要素（/3ys 姓名 身份证 手机号）",
     "qd": "手动触发全账号签到",
     "jf": "查询全账号三平台积分",
     "status": "查看协议号与运行状态",
@@ -435,6 +437,37 @@ def register_handlers(application: Application, app) -> None:
             lines.append(f"• {req.label}（已运行 {elapsed}s）")
         await send_long(msg, "\n".join(lines))
 
+    async def on_3ys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        parts = (msg.text or "").split(maxsplit=1)
+        parsed, err = parse_3ys_args(parts[1] if len(parts) == 2 else "")
+        if not parsed:
+            await msg.reply_text(err)
+            return
+        if app.zhy.lock.locked():
+            await msg.reply_text("已有旧三要素核验进行中，请稍候。")
+            return
+
+        name, id_card, phone = parsed
+        chat_id = update.effective_chat.id
+        async with app.track_request("3ys", f"/3ys {_short_label(name)}"):
+            progress = await msg.reply_text("⏳ 正在提交中核验旧三要素…")
+            editor = ProgressEditor(progress)
+            try:
+                res = await app.zhy.verify_old_3ys(
+                    name, id_card, phone, on_progress=editor.update
+                )
+            except asyncio.CancelledError:
+                await _mark_cancelled(editor, "🛑 旧三要素核验已手动取消并释放。")
+                raise
+            if not res.ok:
+                await editor.update(f"❌ 旧三要素核验失败：{res.reason}", force=True)
+                return
+            chunks = split_text(res.text)
+            await editor.update(chunks[0], force=True)
+            for chunk in chunks[1:]:
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
+
     async def on_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_chat or update.effective_chat.type != "private":
             await update.effective_message.reply_text("登录只能在管理员私聊中进行。")
@@ -476,6 +509,7 @@ def register_handlers(application: Application, app) -> None:
     application.add_handler(CommandHandler("qd", on_checkin))
     application.add_handler(CommandHandler("jf", on_balance))
     application.add_handler(CommandHandler("hw", on_hw))
+    application.add_handler(CommandHandler("3ys", on_3ys))
     application.add_handler(CommandHandler("login", on_login))
     application.add_handler(CommandHandler("cancel", on_cancel))
     # block=False 确保 /jr 等待人工验证回调时不会被阻塞

@@ -21,9 +21,10 @@ from .jr import JRService, ManualVerifyManager
 from .logging_setup import setup_logging
 from .login import LoginService
 from .ocr import OCRService
-from .targets import HW
+from .targets import HW, ZHONGHY, ZHY_OLD_3YS_COST
 from .userbots import UserbotPool
 from .utils import ProcessLock
+from .zhy import ZHYService
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class BotApp:
         self.checkins = CheckinService(self.pool, self.db)
         self.manual_verify = ManualVerifyManager(cfg)
         self.jr = JRService(cfg, self.db, self.pool, self.balances, self.ocr, self.manual_verify)
+        self.zhy = ZHYService(cfg, self.pool, self.balances)
         self.login = LoginService(cfg, self.pool, on_enrolled=self._on_account_enrolled)
 
         self.application = (
@@ -120,6 +122,8 @@ class BotApp:
     def _on_balance_updated(self, phone: str, bot_key: str, value: int) -> None:
         if bot_key == HW.key and value > 0:
             self.hw.clear_insufficient(phone)
+        elif bot_key == ZHONGHY.key and value >= ZHY_OLD_3YS_COST:
+            self.zhy.clear_insufficient(phone)
 
     def _spawn(self, coro, *, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=name)
