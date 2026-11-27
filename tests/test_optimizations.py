@@ -310,3 +310,52 @@ def test_ocr_adaptive_threshold_handles_lighter_glyphs():
 
     idx, ch, conf = recognize_duplicate_char_sync(buf.getvalue(), ["文", "字", "天", "地"], _Eng())
     assert idx == 1 and ch == "字" and conf == pytest.approx(0.8)
+
+
+async def test_manual_verify_cancel_all(tmp_path):
+    cfg = _cfg(tmp_path)
+    mgr = ManualVerifyManager(cfg)
+    loop = asyncio.get_running_loop()
+    fut1 = loop.create_future()
+    fut2 = loop.create_future()
+    mgr._pending["t1"] = (fut1, 2)
+    mgr._pending["t2"] = (fut2, 2)
+    assert mgr.cancel_all() == 2
+    assert fut1.cancelled() and fut2.cancelled()
+
+
+async def test_track_and_release_requests(tmp_path):
+    from bot.app import BotApp
+
+    app = BotApp(_cfg(tmp_path))
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def worker():
+        async with app.track_request("jr", "/jr 测试查询"):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    t = asyncio.create_task(worker())
+    await started.wait()
+
+    # exclude_current=True 不会把自身（未在 track_request 中或当前任务）误计入
+    async with app.track_request("status", "/status 状态检查"):
+        active = app.list_active_requests(exclude_current=True)
+        assert len(active) == 1
+        assert active[0].kind == "jr"
+        assert active[0].label == "/jr 测试查询"
+
+        released = await app.release_requests(exclude_current=True)
+        assert len(released) == 1
+        assert released[0].label == "/jr 测试查询"
+
+    await asyncio.wait_for(cancelled.wait(), timeout=2.0)
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert app.list_active_requests(exclude_current=False) == []
+    await app.ocr.close()

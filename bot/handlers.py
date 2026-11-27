@@ -36,6 +36,7 @@ COMMANDS = {
     "qd": "手动触发全账号签到",
     "jf": "查询全账号三平台积分",
     "status": "查看协议号与运行状态",
+    "release": "手动取消并释放进行中的请求",
     "login": "私聊登录添加协议号",
     "cancel": "取消当前登录流程",
 }
@@ -54,6 +55,11 @@ STATE_LABELS = {
 }
 
 
+def _short_label(text: str, limit: int = 24) -> str:
+    clean = " ".join((text or "").split())
+    return clean if len(clean) <= limit else clean[: limit - 1] + "…"
+
+
 async def safe_edit(msg, text: str) -> None:
     try:
         await msg.edit_text(text)
@@ -62,6 +68,16 @@ async def safe_edit(msg, text: str) -> None:
             log.warning("编辑消息失败", exc_info=exc)
     except TelegramError as exc:
         log.warning("编辑消息失败", exc_info=exc)
+
+
+async def _mark_cancelled(target, text: str) -> None:
+    try:
+        if isinstance(target, ProgressEditor):
+            await asyncio.wait_for(target.update(text, force=True), 2.0)
+        else:
+            await asyncio.wait_for(safe_edit(target, text), 2.0)
+    except Exception:
+        pass
 
 
 async def send_long(message, text: str) -> None:
@@ -116,7 +132,7 @@ def register_handlers(application: Application, app) -> None:
         await update.effective_message.reply_text("\n".join(lines))
 
     async def on_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        async with app.track_request():
+        async with app.track_request("status", "/status 状态检查"):
             accounts = tuple(app.pool.accounts.values())
             await asyncio.gather(*(app.pool.refresh(a) for a in accounts if not a.lock.locked()))
             meta_map = await app.db.all_account_meta()
@@ -153,7 +169,14 @@ def register_handlers(application: Application, app) -> None:
                     lines.append("  最近签到：" + "，".join(ck_by_phone[acc.phone]))
 
             online_cnt = sum(1 for a in accounts if a.state.value == "online")
-            lines.append(f"\n总账号：{len(accounts)} ｜ 在线：{online_cnt} ｜ 进行中请求：{len(app.active_requests)}")
+            active = app.list_active_requests(exclude_current=True)
+            lines.append(f"\n总账号：{len(accounts)} ｜ 在线：{online_cnt} ｜ 进行中请求：{len(active)}")
+            if active:
+                now_mono = time.monotonic()
+                for req in active:
+                    elapsed = max(0, int(now_mono - req.started_at))
+                    lines.append(f"• {req.label}（已运行 {elapsed}s）")
+                lines.append("发送 /release 可手动取消并释放。")
             await send_long(update.effective_message, "\n".join(lines))
 
     async def on_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,9 +184,13 @@ def register_handlers(application: Application, app) -> None:
         if app.checkins.manual_lock.locked():
             await msg.reply_text("已有手动签到正在进行，请稍候。")
             return
-        async with app.track_request(), app.checkins.manual_lock:
+        async with app.track_request("qd", "/qd 手动签到"), app.checkins.manual_lock:
             progress = await msg.reply_text("⏳ 正在执行全账号签到，最多等待 4 分钟…")
-            results = await app.checkins.run_manual_all()
+            try:
+                results = await app.checkins.run_manual_all()
+            except asyncio.CancelledError:
+                await _mark_cancelled(progress, "🛑 手动签到已取消并释放。")
+                raise
             lines = ["📋 手动签到汇总"]
             for phone, items in results:
                 sub = "\n".join(
@@ -182,9 +209,13 @@ def register_handlers(application: Application, app) -> None:
         if balance_lock.locked():
             await msg.reply_text("已有积分查询正在进行，请稍候。")
             return
-        async with app.track_request(), balance_lock:
+        async with app.track_request("jf", "/jf 积分查询"), balance_lock:
             progress = await msg.reply_text("⏳ 正在查询全账号三平台积分，最多等待 4 分钟…")
-            results = await app.balances.query_all()
+            try:
+                results = await app.balances.query_all()
+            except asyncio.CancelledError:
+                await _mark_cancelled(progress, "🛑 积分查询已取消并释放。")
+                raise
             lines = ["📊 账号积分汇总"]
             for phone, items in results:
                 sub = "\n".join(
@@ -237,12 +268,17 @@ def register_handlers(application: Application, app) -> None:
 
         lines = list(dict.fromkeys(ln.strip() for ln in body.splitlines() if ln.strip()))
         chat_id = update.effective_chat.id
+        req_label = f"/jr {_short_label(lines[0])}" if len(lines) == 1 else f"/jr 批量({len(lines)}条)"
 
-        async with app.track_request():
+        async with app.track_request("jr", req_label):
             if len(lines) == 1:
                 progress = await msg.reply_text("⏳ 收到巨人查询任务，准备处理…")
                 editor = ProgressEditor(progress)
-                res = await app.jr.query(lines[0], on_progress=editor.update)
+                try:
+                    res = await app.jr.query(lines[0], on_progress=editor.update)
+                except asyncio.CancelledError:
+                    await _mark_cancelled(editor, "🛑 巨人查询已手动取消并释放。")
+                    raise
                 await _deliver_jr_result(chat_id, context.bot, editor, res)
                 return
 
@@ -250,30 +286,42 @@ def register_handlers(application: Application, app) -> None:
             summary_ed = ProgressEditor(summary, min_interval=1.0)
             hit_cnt = empty_cnt = fail_cnt = 0
             stopped_reason = ""
-            for idx, item in enumerate(lines, 1):
-                if not app.accepting or app.pool.stopping:
-                    stopped_reason = "程序正在关闭"
-                    break
-                p_msg = await msg.reply_text(f"⏳ [{idx}/{len(lines)}] 正在查询…")
-                p_ed = ProgressEditor(p_msg)
-                res = await app.jr.query(
-                    item,
-                    on_progress=lambda t, ed=p_ed, i=idx: ed.update(f"[{i}/{len(lines)}] {t}"),
-                )
-                await _deliver_jr_result(chat_id, context.bot, p_ed, res)
-                if res.ok:
-                    if res.kind == "empty":
-                        empty_cnt += 1
-                    else:
-                        hit_cnt += 1
-                else:
-                    fail_cnt += 1
-                    if res.fatal_batch:
-                        stopped_reason = res.reason
+            p_ed: ProgressEditor | None = None
+            try:
+                for idx, item in enumerate(lines, 1):
+                    if not app.accepting or app.pool.stopping:
+                        stopped_reason = "程序正在关闭"
                         break
-                await summary_ed.update(
-                    f"📦 巨人批量进度：{idx}/{len(lines)}（命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}）"
+                    p_msg = await msg.reply_text(f"⏳ [{idx}/{len(lines)}] 正在查询…")
+                    p_ed = ProgressEditor(p_msg)
+                    res = await app.jr.query(
+                        item,
+                        on_progress=lambda t, ed=p_ed, i=idx: ed.update(f"[{i}/{len(lines)}] {t}"),
+                    )
+                    await _deliver_jr_result(chat_id, context.bot, p_ed, res)
+                    p_ed = None
+                    if res.ok:
+                        if res.kind == "empty":
+                            empty_cnt += 1
+                        else:
+                            hit_cnt += 1
+                    else:
+                        fail_cnt += 1
+                        if res.fatal_batch:
+                            stopped_reason = res.reason
+                            break
+                    await summary_ed.update(
+                        f"📦 巨人批量进度：{idx}/{len(lines)}（命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}）"
+                    )
+            except asyncio.CancelledError:
+                if p_ed is not None:
+                    await _mark_cancelled(p_ed, "🛑 已手动取消。")
+                remain = len(lines) - hit_cnt - empty_cnt - fail_cnt
+                await _mark_cancelled(
+                    summary_ed,
+                    f"🛑 巨人批量已手动取消并释放：命中 {hit_cnt}，空 {empty_cnt}，失败 {fail_cnt}，未执行 {remain}",
                 )
+                raise
 
             remain = len(lines) - hit_cnt - empty_cnt - fail_cnt
             if stopped_reason:
@@ -302,12 +350,17 @@ def register_handlers(application: Application, app) -> None:
 
         lines = list(dict.fromkeys(ln.strip() for ln in parts[1].splitlines() if ln.strip()))
         chat_id = update.effective_chat.id
+        req_label = f"/hw {_short_label(lines[0])}" if len(lines) == 1 else f"/hw 批量({len(lines)}条)"
 
-        async with app.track_request(), hw_batch_lock:
+        async with app.track_request("hw", req_label), hw_batch_lock:
             if len(lines) == 1:
                 progress = await msg.reply_text("⏳ 正在查询核武器…")
                 editor = ProgressEditor(progress)
-                res = await app.hw.query(lines[0], on_progress=editor.update)
+                try:
+                    res = await app.hw.query(lines[0], on_progress=editor.update)
+                except asyncio.CancelledError:
+                    await _mark_cancelled(editor, "🛑 核武器查询已手动取消并释放。")
+                    raise
                 if not res.ok:
                     await editor.update(f"❌ 核武器查询失败：{res.reason}", force=True)
                 elif res.kind == "file" and res.file_path:
@@ -328,26 +381,34 @@ def register_handlers(application: Application, app) -> None:
             summary_ed = ProgressEditor(summary, min_interval=1.0)
             ok_cnt = fail_cnt = 0
             stopped_reason = ""
-            for idx, item in enumerate(lines, 1):
-                if not app.accepting or app.pool.stopping:
-                    stopped_reason = "程序正在关闭"
-                    break
-                await summary_ed.update(f"⏳ 核武器批量第 {idx}/{len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）…")
-                res = await app.hw.query(item)
-                if res.ok:
-                    ok_cnt += 1
-                    if res.kind == "file" and res.file_path:
-                        with Path(res.file_path).open("rb") as f:
-                            await context.bot.send_document(chat_id=chat_id, document=f, filename=res.file_name)
-                    else:
-                        for chunk in split_text(res.text):
-                            await context.bot.send_message(chat_id=chat_id, text=chunk)
-                else:
-                    fail_cnt += 1
-                    await context.bot.send_message(chat_id=chat_id, text=f"❌ 第 {idx} 条查询失败：{res.reason}")
-                    if res.fatal_batch:
-                        stopped_reason = res.reason
+            try:
+                for idx, item in enumerate(lines, 1):
+                    if not app.accepting or app.pool.stopping:
+                        stopped_reason = "程序正在关闭"
                         break
+                    await summary_ed.update(f"⏳ 核武器批量第 {idx}/{len(lines)} 条（成功 {ok_cnt}，失败 {fail_cnt}）…")
+                    res = await app.hw.query(item)
+                    if res.ok:
+                        ok_cnt += 1
+                        if res.kind == "file" and res.file_path:
+                            with Path(res.file_path).open("rb") as f:
+                                await context.bot.send_document(chat_id=chat_id, document=f, filename=res.file_name)
+                        else:
+                            for chunk in split_text(res.text):
+                                await context.bot.send_message(chat_id=chat_id, text=chunk)
+                    else:
+                        fail_cnt += 1
+                        await context.bot.send_message(chat_id=chat_id, text=f"❌ 第 {idx} 条查询失败：{res.reason}")
+                        if res.fatal_batch:
+                            stopped_reason = res.reason
+                            break
+            except asyncio.CancelledError:
+                remain = len(lines) - ok_cnt - fail_cnt
+                await _mark_cancelled(
+                    summary_ed,
+                    f"🛑 核武器批量已手动取消并释放：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}",
+                )
+                raise
 
             remain = len(lines) - ok_cnt - fail_cnt
             if stopped_reason:
@@ -360,6 +421,19 @@ def register_handlers(application: Application, app) -> None:
                     f"✅ 核武器批量完成：共 {len(lines)} 条，成功 {ok_cnt}，失败 {fail_cnt}。",
                     force=True,
                 )
+
+    async def on_release(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        now_mono = time.monotonic()
+        released = await app.release_requests(exclude_current=True)
+        if not released:
+            await msg.reply_text("当前没有进行中的请求需要释放。")
+            return
+        lines = [f"🧹 已手动释放 {len(released)} 个进行中请求："]
+        for req in released:
+            elapsed = max(0, int(now_mono - req.started_at))
+            lines.append(f"• {req.label}（已运行 {elapsed}s）")
+        await send_long(msg, "\n".join(lines))
 
     async def on_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_chat or update.effective_chat.type != "private":
@@ -398,6 +472,7 @@ def register_handlers(application: Application, app) -> None:
     )
     application.add_handler(CommandHandler(["start", "help"], on_start_help))
     application.add_handler(CommandHandler("status", on_status))
+    application.add_handler(CommandHandler(["release", "stop"], on_release))
     application.add_handler(CommandHandler("qd", on_checkin))
     application.add_handler(CommandHandler("jf", on_balance))
     application.add_handler(CommandHandler("hw", on_hw))

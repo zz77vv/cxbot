@@ -5,7 +5,9 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 
 from telegram.ext import Application
 
@@ -24,6 +26,14 @@ from .userbots import UserbotPool
 from .utils import ProcessLock
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ActiveRequest:
+    task: asyncio.Task
+    kind: str
+    label: str
+    started_at: float
 
 
 class BotApp:
@@ -56,7 +66,7 @@ class BotApp:
         self.manual_verify.bot = self.application.bot
 
         self.accepting = True
-        self.active_requests: set[asyncio.Task] = set()
+        self.active_requests: dict[asyncio.Task, ActiveRequest] = {}
         self.stop_event = asyncio.Event()
         self._bg_tasks: set[asyncio.Task] = set()
         self._initialized = False
@@ -64,15 +74,48 @@ class BotApp:
         register_handlers(self.application, self)
 
     @asynccontextmanager
-    async def track_request(self):
+    async def track_request(self, kind: str = "task", label: str = ""):
         task = asyncio.current_task()
         if task is not None:
-            self.active_requests.add(task)
+            self.active_requests[task] = ActiveRequest(
+                task=task,
+                kind=kind,
+                label=label or kind,
+                started_at=time.monotonic(),
+            )
         try:
             yield
         finally:
             if task is not None:
-                self.active_requests.discard(task)
+                self.active_requests.pop(task, None)
+
+    def list_active_requests(self, *, exclude_current: bool = True) -> list[ActiveRequest]:
+        current = asyncio.current_task() if exclude_current else None
+        items = [
+            req
+            for task, req in self.active_requests.items()
+            if task is not current and not task.done()
+        ]
+        items.sort(key=lambda r: r.started_at)
+        return items
+
+    async def release_requests(
+        self,
+        *,
+        exclude_current: bool = True,
+        wait_timeout: float = 5.0,
+    ) -> list[ActiveRequest]:
+        targets = self.list_active_requests(exclude_current=exclude_current)
+        self.manual_verify.cancel_all()
+        if not targets:
+            return []
+        tasks = [req.task for req in targets]
+        for task in tasks:
+            task.cancel()
+        done, _ = await asyncio.wait(tasks, timeout=wait_timeout)
+        for task in done:
+            self.active_requests.pop(task, None)
+        return targets
 
     def _on_balance_updated(self, phone: str, bot_key: str, value: int) -> None:
         if bot_key == HW.key and value > 0:
@@ -144,7 +187,7 @@ class BotApp:
                 log.warning("停止轮询异常", exc_info=exc)
 
         # 2. 等待在途查询/签到请求自然结束，避免直接断库导致中断
-        in_flight = tuple(self.active_requests)
+        in_flight = tuple(self.active_requests.keys())
         if in_flight:
             log.info("等待 %d 个在途请求完成…", len(in_flight))
             _, pending = await asyncio.wait(in_flight, timeout=self.cfg.shutdown_timeout)

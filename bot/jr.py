@@ -306,6 +306,14 @@ class ManualVerifyManager:
         fut.set_result(idx)
         await query.answer("已收到选择，正在提交…")
 
+    def cancel_all(self) -> int:
+        count = 0
+        for fut, _ in tuple(self._pending.values()):
+            if not fut.done():
+                fut.cancel()
+                count += 1
+        return count
+
     async def ask_admin(
         self,
         phone: str,
