@@ -82,3 +82,36 @@ def test_extract_captcha_candidates_ignores_control_buttons():
     )
     cands = extract_captcha_candidates(msg)
     assert [c.label for c in cands] == ["字", "文"]
+
+
+def test_ocr_rotated_fallback_recovers_when_single_view_fails():
+    # 4 个切片：第 1 个双视图识别一致('字')；第 3 个双视图分歧('天'/'地')，但在微旋兜底时识别出 '字'
+    readings = [
+        ("字", 0.9), ("字", 0.9),  # slice 0: strict hit '字'
+        ("文", 0.9), ("文", 0.9),  # slice 1: strict hit '文'
+        ("天", 0.3), ("地", 0.3),  # slice 2: disagreement and below 0.35
+        ("天", 0.9), ("天", 0.9),  # slice 3: strict hit '天'
+        # 第二级兜底对 slice 2 尝试 -10° / +10° 微旋
+        ("字", 0.75),
+    ]
+    idx, ch, conf = recognize_duplicate_char_sync(
+        make_captcha_image(4), ["文", "字", "天", "地"], FakeEngine(readings)
+    )
+    assert (idx, ch) == (1, "字")
+    assert conf == pytest.approx(0.75)
+
+
+def test_ocr_whole_line_fallback_when_segmentation_fails():
+    from io import BytesIO
+    from PIL import Image
+
+    # 纯白无明显竖条的图片，导致切分失败，触发第三级整行识别兜底
+    img = Image.new("RGB", (320, 120), "white")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+
+    idx, ch, conf = recognize_duplicate_char_sync(
+        buf.getvalue(), ["飞", "月", "见", "牛"], FakeEngine([("月牛牛飞见", 0.88)])
+    )
+    assert (idx, ch) == (3, "牛")
+    assert conf == pytest.approx(0.88)
