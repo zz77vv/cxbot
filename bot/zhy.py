@@ -12,6 +12,7 @@ from telethon.errors import FloodWaitError
 
 from .balance import BalanceService, parse_balance_text
 from .config import Config
+from .db import CachedResult, Database, make_cache_key
 from .targets import (
     ZHY_INSUFFICIENT_KEYWORDS,
     ZHY_MENU_TIMEOUT,
@@ -47,6 +48,7 @@ class ZHYResult:
     reason: str = ""
     phone: str = ""
     fatal_batch: bool = False
+    from_cache: bool = False
 
 
 def parse_3ys_args(raw: str) -> tuple[tuple[str, str, str] | None, str]:
@@ -110,13 +112,16 @@ def classify_zhy_result(res: ZHYResult) -> str:
     return "error"
 
 
+_SUMMARY_ORDER = {"match": 0, "mismatch": 1, "error": 2}
+
+
 def format_3ys_batch_summary(
     entries: list[tuple[tuple[str, str, str], ZHYResult]],
     *,
     total: int,
     stopped_reason: str = "",
 ) -> str:
-    """将批量核验结果整理为紧凑美观的分类汇总报告。"""
+    """将批量核验结果按「一致 → 不一致 → 出错/失败」分组排序并输出紧凑报告。"""
     match_cnt = mismatch_cnt = err_cnt = 0
     for _, r in entries:
         kind = classify_zhy_result(r)
@@ -127,6 +132,7 @@ def format_3ys_batch_summary(
         else:
             err_cnt += 1
 
+    ordered = sorted(entries, key=lambda item: _SUMMARY_ORDER[classify_zhy_result(item[1])])
     remain = max(0, total - len(entries))
     lines = [
         f"📋 旧三要素核验汇总（共 {total} 条）",
@@ -136,8 +142,12 @@ def format_3ys_batch_summary(
         lines.append(f"⚠️ 提前暂停（未执行 {remain} 条）：{stopped_reason}")
 
     blocks = ["\n".join(lines)]
-    for idx, ((name, id_card, phone), res) in enumerate(entries, 1):
-        detail = extract_zhy_conclusion(res.text) if res.ok else f"❌ {res.reason}"
+    for idx, ((name, id_card, phone), res) in enumerate(ordered, 1):
+        if res.ok:
+            suffix = "（缓存）" if res.from_cache else ""
+            detail = f"{extract_zhy_conclusion(res.text)}{suffix}"
+        else:
+            detail = f"❌ {res.reason}"
         blocks.append(f"{idx}. {name}  {id_card}  {phone}\n   └ {detail}")
     return "\n\n".join(blocks)
 
@@ -160,14 +170,37 @@ def is_zhy_3ys_prompt(msg) -> bool:
 
 
 class ZHYService:
-    """中核验旧三要素服务：串行锁保护、按金币优先选号、不足自动换号。"""
+    """中核验旧三要素服务：结果缓存、多空闲号并发抢占、金币回写与不足自动换号。"""
 
-    def __init__(self, cfg: Config, pool: UserbotPool, balances: BalanceService):
+    def __init__(self, cfg: Config, db: Database, pool: UserbotPool, balances: BalanceService):
         self.cfg = cfg
+        self.db = db
         self.pool = pool
         self.balances = balances
-        self.lock = asyncio.Lock()
         self._insufficient_until: dict[str, float] = {}
+
+    @staticmethod
+    def _cache_key(name: str, id_card: str, phone: str) -> str:
+        return make_cache_key("zhy3ys", f"{name} {id_card} {phone}")
+
+    async def _get_cached_3ys(self, name: str, id_card: str, phone: str) -> ZHYResult | None:
+        if self.cfg.result_cache_ttl <= 0:
+            return None
+        hit = await self.db.get_cache(self._cache_key(name, id_card, phone))
+        if hit and hit.text:
+            return ZHYResult(ok=True, text=hit.text, from_cache=True)
+        return None
+
+    async def _save_cached_3ys(self, name: str, id_card: str, phone: str, res: ZHYResult) -> None:
+        if self.cfg.result_cache_ttl <= 0 or res.from_cache or not res.ok:
+            return
+        if classify_zhy_result(res) not in ("match", "mismatch"):
+            return
+        await self.db.set_cache(
+            self._cache_key(name, id_card, phone),
+            CachedResult(result_type="text", text=res.text),
+            self.cfg.result_cache_ttl,
+        )
 
     def clear_insufficient(self, phone: str) -> None:
         self._insufficient_until.pop(phone, None)
@@ -321,7 +354,13 @@ class ZHYService:
                     self._mark_insufficient(account.phone)
                     return None, True
 
-                self.balances.invalidate(account.phone, ZHONGHY.key)
+                if coins is not None:
+                    remain = max(0, coins - ZHY_OLD_3YS_COST)
+                    if remain < ZHY_OLD_3YS_COST:
+                        self._mark_insufficient(account.phone)
+                    self.balances.set_cached(account.phone, ZHONGHY.key, remain)
+                else:
+                    self.balances.invalidate(account.phone, ZHONGHY.key)
                 return ZHYResult(ok=True, text=final_text, phone=account.phone), False
         except AccountUnavailable:
             return None, True
@@ -342,8 +381,14 @@ class ZHYService:
         on_progress: ProgressCallback | None = None,
         wait_for_account: bool = True,
         stop_event: asyncio.Event | None = None,
+        use_cache: bool = True,
     ) -> ZHYResult:
-        """执行中核验旧三要素核验（支持多协程并发抢占不同空闲协议号）。"""
+        """执行中核验旧三要素核验（支持缓存命中与多协程并发抢占空闲协议号）。"""
+        if use_cache:
+            cached = await self._get_cached_3ys(name, id_card, phone)
+            if cached is not None:
+                return cached
+
         deadline = time.monotonic() + 90.0
         while True:
             if stop_event and stop_event.is_set():
@@ -375,6 +420,7 @@ class ZHYService:
                         acc, name, id_card, phone, on_progress
                     )
                     if res is not None:
+                        await self._save_cached_3ys(name, id_card, phone, res)
                         return res
                     if try_next:
                         skipped_count += 1
@@ -409,10 +455,25 @@ class ZHYService:
         *,
         on_progress: ProgressCallback | None = None,
         should_stop: Callable[[], bool] | None = None,
+        collected: dict[int, ZHYResult] | None = None,
     ) -> tuple[list[tuple[tuple[str, str, str], ZHYResult]], str]:
-        """多空闲协议号并发批量核验，按原输入顺序返回已完成条目与中止原因。"""
+        """多空闲协议号并发批量核验（先查缓存，仅未命中项调度协议号）。"""
         if not items:
             return [], ""
+
+        results = collected if collected is not None else {}
+        counts = {"match": 0, "mismatch": 0, "error": 0}
+        pending_items: list[tuple[int, tuple[str, str, str]]] = []
+        for idx, item in enumerate(items):
+            cached = await self._get_cached_3ys(*item)
+            if cached is not None:
+                results[idx] = cached
+                counts[classify_zhy_result(cached)] += 1
+            else:
+                pending_items.append((idx, item))
+
+        if not pending_items:
+            return [(items[i], results[i]) for i in sorted(results)], ""
 
         all_online = [
             acc for acc in self.pool.accounts.values()
@@ -425,21 +486,19 @@ class ZHYService:
                 if all_insufficient
                 else "当前没有可用的在线协议号。"
             )
-            return [], reason
+            return [(items[i], results[i]) for i in sorted(results)], reason
 
-        worker_count = min(len(items), len(eligible), max(self.cfg.max_concurrency, 5), 6)
+        worker_count = min(len(pending_items), len(eligible), max(1, self.cfg.max_concurrency))
         queue: asyncio.Queue[tuple[int, tuple[str, str, str]]] = asyncio.Queue()
-        for idx, item in enumerate(items):
-            queue.put_nowait((idx, item))
+        for pair in pending_items:
+            queue.put_nowait(pair)
 
-        results: dict[int, ZHYResult] = {}
         stop_event = asyncio.Event()
         stopped_reason = ""
-        counts = {"match": 0, "mismatch": 0, "error": 0}
 
         if on_progress:
             await on_progress(
-                f"🚀 已启用 {worker_count} 个协议号并发核验：0/{len(items)}…"
+                f"🚀 已启用 {worker_count} 路并发核验：{len(results)}/{len(items)}…"
             )
 
         async def _worker():
@@ -455,10 +514,11 @@ class ZHYService:
                     break
                 try:
                     res = await self.verify_old_3ys(
-                        name, id_card, phone, stop_event=stop_event
+                        name, id_card, phone, stop_event=stop_event, use_cache=False
                     )
                     if stop_event.is_set() and not res.ok and res.reason == "批量任务已停止。":
                         break
+                    await self._save_cached_3ys(name, id_card, phone, res)
                     results[idx] = res
                     counts[classify_zhy_result(res)] += 1
                     if not res.ok and res.fatal_batch and not stopped_reason:

@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from .targets import JR_FREE_DAILY_LIMIT, TARGETS
 from .utils import ProgressEditor, split_text
-from .zhy import classify_zhy_result, format_3ys_batch_summary, parse_3ys_batch
+from .zhy import ZHYResult, classify_zhy_result, format_3ys_batch_summary, parse_3ys_batch
 
 log = logging.getLogger(__name__)
 
@@ -232,6 +232,12 @@ def register_handlers(application: Application, app) -> None:
             for chunk in chunks[1:]:
                 await msg.reply_text(chunk)
 
+    async def _deliver_text(chat_id: int, bot, editor: ProgressEditor, text: str) -> None:
+        chunks = split_text(text)
+        await editor.update(chunks[0], force=True)
+        for chunk in chunks[1:]:
+            await bot.send_message(chat_id=chat_id, text=chunk)
+
     async def _deliver_jr_result(chat_id: int, bot, editor: ProgressEditor, res) -> None:
         if not res.ok:
             await editor.update(f"❌ 巨人查询未完成：{res.reason}", force=True)
@@ -255,10 +261,7 @@ def register_handlers(application: Application, app) -> None:
             return
 
         prefix = "✅ 巨人查询完成（命中缓存）\n\n" if res.from_cache else "✅ 巨人查询完成\n\n"
-        chunks = split_text(prefix + res.text)
-        await editor.update(chunks[0], force=True)
-        for chunk in chunks[1:]:
-            await bot.send_message(chat_id=chat_id, text=chunk)
+        await _deliver_text(chat_id, bot, editor, prefix + res.text)
 
     async def on_jr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
@@ -374,10 +377,7 @@ def register_handlers(application: Application, app) -> None:
                     except TelegramError:
                         await editor.update("✅ 核武器 TXT 已发送。", force=True)
                 else:
-                    chunks = split_text(res.text)
-                    await editor.update(chunks[0], force=True)
-                    for chunk in chunks[1:]:
-                        await context.bot.send_message(chat_id=chat_id, text=chunk)
+                    await _deliver_text(chat_id, context.bot, editor, res.text)
                 return
 
             summary = await msg.reply_text(f"📦 核武器批量查询：共 {len(lines)} 条，逐条执行…")
@@ -477,10 +477,8 @@ def register_handlers(application: Application, app) -> None:
                 if not res.ok:
                     await editor.update(f"❌ 旧三要素核验失败：{res.reason}", force=True)
                     return
-                chunks = split_text(res.text)
-                await editor.update(chunks[0], force=True)
-                for chunk in chunks[1:]:
-                    await context.bot.send_message(chat_id=chat_id, text=chunk)
+                prefix = "♻️（命中缓存）\n" if res.from_cache else ""
+                await _deliver_text(chat_id, context.bot, editor, prefix + res.text)
             return
 
         async with zhy_batch_lock, app.track_request("3ys", f"/3ys 批量({len(items)}条)"):
@@ -488,14 +486,32 @@ def register_handlers(application: Application, app) -> None:
                 f"📦 旧三要素批量核验：共 {len(items)} 条（已去重），准备并发调度…"
             )
             summary_ed = ProgressEditor(summary, min_interval=1.0)
+            collected: dict[int, ZHYResult] = {}
             try:
                 entries, stopped_reason = await app.zhy.verify_old_3ys_batch(
                     items,
                     on_progress=summary_ed.update,
                     should_stop=lambda: not app.accepting or app.pool.stopping,
+                    collected=collected,
                 )
             except asyncio.CancelledError:
-                await _mark_cancelled(summary_ed, "🛑 旧三要素批量已手动取消并释放。")
+                partial_entries = [(items[i], collected[i]) for i in sorted(collected)]
+                remain = len(items) - len(partial_entries)
+                await _mark_cancelled(
+                    summary_ed,
+                    f"🛑 旧三要素批量已手动取消并释放（已完成 {len(partial_entries)}/{len(items)}，未执行 {remain}）。",
+                )
+                if partial_entries:
+                    report = format_3ys_batch_summary(
+                        partial_entries, total=len(items), stopped_reason="手动取消"
+                    )
+                    for chunk in split_text(report):
+                        try:
+                            await asyncio.wait_for(
+                                context.bot.send_message(chat_id=chat_id, text=chunk), 2.0
+                            )
+                        except Exception:
+                            break
                 raise
 
             match_cnt = sum(1 for _, r in entries if classify_zhy_result(r) == "match")
@@ -555,8 +571,8 @@ def register_handlers(application: Application, app) -> None:
         CallbackQueryHandler(app.manual_verify.handle_callback, pattern=r"^jrverify:[\w-]+:\d+$")
     )
     application.add_handler(CommandHandler(["start", "help"], on_start_help))
-    application.add_handler(CommandHandler("status", on_status))
-    application.add_handler(CommandHandler(["release", "stop"], on_release))
+    application.add_handler(CommandHandler("status", on_status, block=False))
+    application.add_handler(CommandHandler(["release", "stop"], on_release, block=False))
     application.add_handler(CommandHandler("qd", on_checkin))
     application.add_handler(CommandHandler("jf", on_balance))
     application.add_handler(CommandHandler("hw", on_hw))

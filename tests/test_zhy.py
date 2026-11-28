@@ -100,10 +100,9 @@ async def test_zhy_old_3ys_full_flow_with_menu_edit_and_pending_edit(tmp_path):
         pool.accounts["10001"] = acc
 
         balances = BalanceService(pool, cache_ttl=60)
-        # 预先写入余额缓存，验证核验成功后缓存会被失效
         balances._cache[("10001", ZHONGHY.key)] = (3, 10**12)
 
-        svc = ZHYService(cfg, pool, balances)
+        svc = ZHYService(cfg, db, pool, balances)
         res = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
 
         assert res.ok and res.text == final_text
@@ -113,7 +112,8 @@ async def test_zhy_old_3ys_full_flow_with_menu_edit_and_pending_edit(tmp_path):
             ZHONGHY.username,
             "张三 532929200803051914 15356921055",
         )
-        assert balances.peek_cached("10001", ZHONGHY.key) is None
+        # 菜单识别 3 金币后扣 1，应回写为 2
+        assert balances.peek_cached("10001", ZHONGHY.key) == 2
     finally:
         await db.close()
 
@@ -153,7 +153,7 @@ async def test_zhy_auto_switches_account_when_coins_insufficient(tmp_path):
         pool.accounts["10002"] = a2
 
         balances = BalanceService(pool, cache_ttl=60)
-        svc = ZHYService(cfg, pool, balances)
+        svc = ZHYService(cfg, db, pool, balances)
 
         res = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
         assert res.ok
@@ -208,24 +208,27 @@ def test_extract_zhy_conclusion_and_classify():
 
 
 def test_format_3ys_batch_summary():
+    # 故意乱序传入，验证按 一致 -> 不一致 -> 出错/失败 分组排序
     entries = [
         (
-            ("杨璐", "510202198001081886", "15683602834"),
-            ZHYResult(ok=True, text="name: 杨璐\nidcard: 510202198001081886\nphone: 15683602834\n\n🟢 运营商三要素核验一致"),
+            ("陈丕福", "432421196709289810", "13927381466"),
+            ZHYResult(ok=True, text="🟡 核验出错"),
         ),
         (
             ("陈洋", "210181197106288335", "15998890119"),
             ZHYResult(ok=True, text="name: 陈洋\n\n🔴 运营商三要素核验不一致"),
         ),
         (
-            ("陈丕福", "432421196709289810", "13927381466"),
-            ZHYResult(ok=True, text="🟡 核验出错"),
+            ("杨璐", "510202198001081886", "15683602834"),
+            ZHYResult(ok=True, text="name: 杨璐\nidcard: 510202198001081886\nphone: 15683602834\n\n🟢 运营商三要素核验一致", from_cache=True),
         ),
     ]
     text = format_3ys_batch_summary(entries, total=4, stopped_reason="金币不足")
     assert "🟢 一致：1 ｜ 🔴 不一致：1 ｜ 🟡 出错/失败：1" in text
     assert "提前暂停（未执行 1 条）：金币不足" in text
-    assert "1. 杨璐  510202198001081886  15683602834\n   └ 🟢 运营商三要素核验一致" in text
+    assert "1. 杨璐  510202198001081886  15683602834\n   └ 🟢 运营商三要素核验一致（缓存）" in text
+    assert "2. 陈洋  210181197106288335  15998890119\n   └ 🔴 运营商三要素核验不一致" in text
+    assert "3. 陈丕福  432421196709289810  13927381466\n   └ 🟡 核验出错" in text
     assert "name:" not in text
 
 
@@ -256,7 +259,7 @@ async def test_zhy_batch_concurrent_execution(tmp_path):
             )
             pool.accounts[phone] = Account(phone, tmp_path / f"{i}.session", client, AccountState.ONLINE)
 
-        svc = ZHYService(cfg, pool, BalanceService(pool, cache_ttl=60))
+        svc = ZHYService(cfg, db, pool, BalanceService(pool, cache_ttl=60))
         items = [
             ("用户0", "532929200803051914", "15356921055"),
             ("用户1", "510202198001081886", "15683602834"),
@@ -287,9 +290,122 @@ async def test_zhy_fatal_batch_flag_on_all_insufficient(tmp_path):
         )
         pool = UserbotPool(cfg, db)
         pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
-        svc = ZHYService(cfg, pool, BalanceService(pool, cache_ttl=60))
+        svc = ZHYService(cfg, db, pool, BalanceService(pool, cache_ttl=60))
 
         res = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
         assert not res.ok and res.fatal_batch
+    finally:
+        await db.close()
+
+
+async def test_zhy_balance_reaches_zero_auto_cools_down(tmp_path):
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        menu = _msg(2, "您的金币 💲：1", buttons=[[_btn("旧三要素核验")]])
+        prompt = _msg(2, "🔐 旧三要素核验\n发送: 姓名 身份证号 手机号", edit_date="t1")
+        res_msg = _msg(4, "name: 张三\n\n🟢 运营商三要素核验一致")
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(side_effect=[_msg(1, "/start", out=True), _msg(3, "q", out=True)]),
+            get_messages=AsyncMock(side_effect=[[menu], prompt, [res_msg]]),
+        )
+        pool = UserbotPool(cfg, db)
+        pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        balances = BalanceService(pool, cache_ttl=60)
+        svc = ZHYService(cfg, db, pool, balances)
+
+        res = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
+        assert res.ok
+        assert balances.peek_cached("10001", ZHONGHY.key) == 0
+        assert svc._is_in_insufficient_cooldown("10001")
+    finally:
+        await db.close()
+
+
+async def test_zhy_cache_hit_and_skip_error_caching(tmp_path):
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        menu1 = _msg(2, "您的金币 💲：5", buttons=[[_btn("旧三要素核验")]])
+        prompt1 = _msg(2, "🔐 旧三要素核验\n发送: 姓名 身份证号 手机号", edit_date="t1")
+        ok_msg = _msg(4, "name: 张三\n\n🟢 运营商三要素核验一致")
+        menu2 = _msg(6, "您的金币 💲：4", buttons=[[_btn("旧三要素核验")]])
+        prompt2 = _msg(6, "🔐 旧三要素核验\n发送: 姓名 身份证号 手机号", edit_date="t2")
+        err_msg = _msg(8, "name: 李四\n\n🟡 核验出错")
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(
+                side_effect=[
+                    _msg(1, "/start", out=True),
+                    _msg(3, "q1", out=True),
+                    _msg(5, "/start", out=True),
+                    _msg(7, "q2", out=True),
+                ]
+            ),
+            get_messages=AsyncMock(side_effect=[[menu1], prompt1, [ok_msg], [menu2], prompt2, [err_msg]]),
+        )
+        pool = UserbotPool(cfg, db)
+        pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        svc = ZHYService(cfg, db, pool, BalanceService(pool, cache_ttl=60))
+
+        # 第一次查询一致 -> 写入缓存；第二次查同一人直接命中缓存（不再发消息）
+        r1 = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
+        r2 = await svc.verify_old_3ys("张三", "532929200803051914", "15356921055")
+        assert r1.ok and not r1.from_cache
+        assert r2.ok and r2.from_cache
+        assert client.send_message.await_count == 2
+
+        # 核验出错结果不得写入缓存
+        r3 = await svc.verify_old_3ys("李四", "130503670401001", "13800138000")
+        assert r3.ok and not r3.from_cache
+        assert await svc._get_cached_3ys("李四", "130503670401001", "13800138000") is None
+    finally:
+        await db.close()
+
+
+async def test_zhy_batch_cancel_preserves_collected_results(tmp_path):
+    import asyncio
+
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        menu = _msg(2, "您的金币 💲：5", buttons=[[_btn("旧三要素核验")]])
+        prompt = _msg(2, "🔐 旧三要素核验\n发送: 姓名 身份证号 手机号", edit_date="t1")
+        first_done = asyncio.Event()
+
+        async def _send(target, text):
+            if "15356921055" in text:
+                return _msg(3, text, out=True)
+            if "15683602834" in text:
+                first_done.set()
+                await asyncio.sleep(30)
+            return _msg(1, text, out=True)
+
+        ok_msg = _msg(4, "name: 用户0\n\n🟢 运营商三要素核验一致")
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(side_effect=_send),
+            get_messages=AsyncMock(side_effect=[[menu], prompt, [ok_msg], [menu], prompt]),
+        )
+        pool = UserbotPool(cfg, db)
+        pool.accounts["10001"] = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        svc = ZHYService(cfg, db, pool, BalanceService(pool, cache_ttl=60))
+
+        items = [
+            ("用户0", "532929200803051914", "15356921055"),
+            ("用户1", "510202198001081886", "15683602834"),
+        ]
+        collected: dict[int, ZHYResult] = {}
+        task = asyncio.create_task(svc.verify_old_3ys_batch(items, collected=collected))
+        await asyncio.wait_for(first_done.wait(), timeout=2.0)
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert 0 in collected and collected[0].ok
     finally:
         await db.close()

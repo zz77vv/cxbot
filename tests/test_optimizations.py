@@ -359,3 +359,28 @@ async def test_track_and_release_requests(tmp_path):
         await t
     assert app.list_active_requests(exclude_current=False) == []
     await app.ocr.close()
+
+
+async def test_hold_account_quick_reconnects_on_transient_disconnect(tmp_path):
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        state = {"connected": False}
+
+        async def _connect():
+            state["connected"] = True
+
+        client = SimpleNamespace(
+            is_connected=lambda: state["connected"],
+            connect=AsyncMock(side_effect=_connect),
+        )
+        pool = UserbotPool(cfg, db)
+        acc = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        pool.accounts["10001"] = acc
+
+        async with pool.hold_account(acc) as c:
+            assert c is client
+            assert state["connected"]
+        client.connect.assert_awaited_once()
+    finally:
+        await db.close()

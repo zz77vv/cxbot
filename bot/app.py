@@ -53,7 +53,7 @@ class BotApp:
         self.checkins = CheckinService(self.pool, self.db)
         self.manual_verify = ManualVerifyManager(cfg)
         self.jr = JRService(cfg, self.db, self.pool, self.balances, self.ocr, self.manual_verify)
-        self.zhy = ZHYService(cfg, self.pool, self.balances)
+        self.zhy = ZHYService(cfg, self.db, self.pool, self.balances)
         self.login = LoginService(cfg, self.pool, on_enrolled=self._on_account_enrolled)
 
         self.application = (

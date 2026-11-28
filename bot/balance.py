@@ -57,6 +57,13 @@ class BalanceService:
         hit = self._get_cached((phone, bot_key))
         return hit.value if hit is not None else None
 
+    def set_cached(self, phone: str, bot_key: str, value: int) -> None:
+        """主动回写余额缓存并触发更新回调（避免重复发查询指令）。"""
+        if self.cache_ttl > 0:
+            self._cache[(phone, bot_key)] = (value, time.monotonic() + self.cache_ttl)
+        if self.on_balance_updated:
+            self.on_balance_updated(phone, bot_key, value)
+
     async def query(
         self, account: Account, target: TargetBot, *, use_cache: bool = False
     ) -> BalanceResult:

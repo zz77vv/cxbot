@@ -277,9 +277,20 @@ class UserbotPool:
         async with account.lock:
             if self.stopping or account.flood_until > time.time() or account.state != AccountState.ONLINE:
                 raise AccountUnavailable("account_unavailable")
-            if not account.client or not account.client.is_connected():
+            if not account.client:
                 account.state = AccountState.OFFLINE
                 raise AccountUnavailable("account_disconnected")
+            if not account.client.is_connected():
+                try:
+                    await asyncio.wait_for(
+                        account.client.connect(), min(10.0, self.cfg.reply_timeout)
+                    )
+                except Exception:
+                    account.state = AccountState.OFFLINE
+                    raise AccountUnavailable("account_disconnected") from None
+                if not account.client.is_connected():
+                    account.state = AccountState.OFFLINE
+                    raise AccountUnavailable("account_disconnected")
             try:
                 yield account.client
             except FloodWaitError as exc:
