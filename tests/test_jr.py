@@ -258,7 +258,7 @@ async def test_jr_preverify_passes_ocr_without_resubmitting_and_skips_same_day(t
         verify_msg.click = AsyncMock(return_value=SimpleNamespace(message="验证通过"))
         client = SimpleNamespace(
             is_connected=lambda: True,
-            send_message=AsyncMock(return_value=_msg(1, "00000000000", out=True)),
+            send_message=AsyncMock(return_value=_msg(1, "110101199001011234", out=True)),
             get_messages=AsyncMock(return_value=[verify_msg]),
             download_media=AsyncMock(return_value=b"fake-img"),
         )
@@ -290,13 +290,13 @@ async def test_jr_preverify_already_ok_and_ocr_failure_does_not_prompt_manual(tm
         ok_reply = _msg(2, "抱歉，未找到相关信息。")
         c1 = SimpleNamespace(
             is_connected=lambda: True,
-            send_message=AsyncMock(return_value=_msg(1, "00000000000", out=True)),
+            send_message=AsyncMock(return_value=_msg(1, "110101199001011234", out=True)),
             get_messages=AsyncMock(return_value=[ok_reply]),
         )
         verify_msg = _msg(12, "安全验证，请点击下图", buttons=[[_btn("甲"), _btn("乙")]], media=object())
         c2 = SimpleNamespace(
             is_connected=lambda: True,
-            send_message=AsyncMock(return_value=_msg(11, "00000000000", out=True)),
+            send_message=AsyncMock(return_value=_msg(11, "110101199001011234", out=True)),
             get_messages=AsyncMock(return_value=[verify_msg]),
             download_media=AsyncMock(return_value=b"fake-img"),
         )
