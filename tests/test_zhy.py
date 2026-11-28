@@ -12,7 +12,15 @@ from bot.config import Config
 from bot.db import Database
 from bot.targets import ZHONGHY
 from bot.userbots import Account, AccountState, UserbotPool
-from bot.zhy import ZHYResult, ZHYService, format_3ys_batch_summary, parse_3ys_args, parse_3ys_batch
+from bot.zhy import (
+    ZHYResult,
+    ZHYService,
+    classify_zhy_result,
+    extract_zhy_conclusion,
+    format_3ys_batch_summary,
+    parse_3ys_args,
+    parse_3ys_batch,
+)
 
 
 def _cfg(tmp_path: Path) -> Config:
@@ -181,16 +189,87 @@ def test_parse_3ys_batch_dedup_and_error_report():
     assert len(bad_errs) == 1 and bad_errs[0].startswith("第 2 行：")
 
 
+def test_extract_zhy_conclusion_and_classify():
+    raw = (
+        "name: 吉娜\n"
+        "idcard: 511002200404276821\n"
+        "phone: 13678226436\n\n"
+        "🔴 运营商三要素核验不一致\n\n"
+        "🟢 12306信息核验一致"
+    )
+    assert extract_zhy_conclusion(raw) == "🔴 运营商三要素核验不一致 ｜ 🟢 12306信息核验一致"
+    assert classify_zhy_result(ZHYResult(ok=True, text=raw)) == "mismatch"
+    assert classify_zhy_result(ZHYResult(ok=True, text="name: A\n🟢 运营商三要素核验一致")) == "match"
+    assert classify_zhy_result(ZHYResult(ok=True, text="name: B\n🟡 核验出错")) == "error"
+    assert classify_zhy_result(ZHYResult(ok=False, reason="超时")) == "error"
+
+
 def test_format_3ys_batch_summary():
     entries = [
-        (("张三", "532929200803051914", "15356921055"), ZHYResult(ok=True, text="🟢 一致")),
-        (("李四", "130503670401001", "13800138000"), ZHYResult(ok=False, reason="金币不足")),
+        (
+            ("杨璐", "510202198001081886", "15683602834"),
+            ZHYResult(ok=True, text="name: 杨璐\nidcard: 510202198001081886\nphone: 15683602834\n\n🟢 运营商三要素核验一致"),
+        ),
+        (
+            ("陈洋", "210181197106288335", "15998890119"),
+            ZHYResult(ok=True, text="name: 陈洋\n\n🔴 运营商三要素核验不一致"),
+        ),
+        (
+            ("陈丕福", "432421196709289810", "13927381466"),
+            ZHYResult(ok=True, text="🟡 核验出错"),
+        ),
     ]
-    text = format_3ys_batch_summary(entries, total=3, stopped_reason="金币不足")
-    assert "成功 1，失败 1，未执行 1" in text
-    assert "原因：金币不足" in text
-    assert "【1】张三 532929200803051914 15356921055\n🟢 一致" in text
-    assert "【2】李四 130503670401001 13800138000\n❌ 失败：金币不足" in text
+    text = format_3ys_batch_summary(entries, total=4, stopped_reason="金币不足")
+    assert "🟢 一致：1 ｜ 🔴 不一致：1 ｜ 🟡 出错/失败：1" in text
+    assert "提前暂停（未执行 1 条）：金币不足" in text
+    assert "1. 杨璐  510202198001081886  15683602834\n   └ 🟢 运营商三要素核验一致" in text
+    assert "name:" not in text
+
+
+async def test_zhy_batch_concurrent_execution(tmp_path):
+    import asyncio
+    import time
+
+    cfg = _cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        pool = UserbotPool(cfg, db)
+        for i in range(3):
+            phone = f"1000{i + 1}"
+            menu = _msg(2, "您的金币 💲：5", buttons=[[_btn("旧三要素核验")]])
+            prompt = _msg(2, "🔐 旧三要素核验\n发送: 姓名 身份证号 手机号", edit_date="t1")
+
+            async def _delayed_send(target, text, _i=i):
+                if text == "/start":
+                    return _msg(1, text, out=True)
+                await asyncio.sleep(0.15)
+                return _msg(10 + _i, text, out=True)
+
+            res_msg = _msg(20 + i, f"name: 用户{i}\n\n🟢 运营商三要素核验一致")
+            client = SimpleNamespace(
+                is_connected=lambda: True,
+                send_message=AsyncMock(side_effect=_delayed_send),
+                get_messages=AsyncMock(side_effect=[[menu], prompt, [res_msg]]),
+            )
+            pool.accounts[phone] = Account(phone, tmp_path / f"{i}.session", client, AccountState.ONLINE)
+
+        svc = ZHYService(cfg, pool, BalanceService(pool, cache_ttl=60))
+        items = [
+            ("用户0", "532929200803051914", "15356921055"),
+            ("用户1", "510202198001081886", "15683602834"),
+            ("用户2", "512223196903081978", "19132696215"),
+        ]
+        t0 = time.monotonic()
+        entries, stopped = await svc.verify_old_3ys_batch(items)
+        elapsed = time.monotonic() - t0
+
+        assert stopped == ""
+        assert len(entries) == 3
+        assert all(r.ok for _, r in entries)
+        assert [e[0][0] for e in entries] == ["用户0", "用户1", "用户2"]
+        assert elapsed < 0.35
+    finally:
+        await db.close()
 
 
 async def test_zhy_fatal_batch_flag_on_all_insufficient(tmp_path):

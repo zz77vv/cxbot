@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from .targets import JR_FREE_DAILY_LIMIT, TARGETS
 from .utils import ProgressEditor, split_text
-from .zhy import ZHYResult, format_3ys_batch_summary, parse_3ys_batch
+from .zhy import classify_zhy_result, format_3ys_batch_summary, parse_3ys_batch
 
 log = logging.getLogger(__name__)
 
@@ -457,88 +457,62 @@ def register_handlers(application: Application, app) -> None:
         if not items:
             await msg.reply_text("用法：/3ys 姓名 身份证 手机号")
             return
-        if zhy_batch_lock.locked() or app.zhy.lock.locked():
-            await msg.reply_text("已有旧三要素核验任务进行中，请稍候。")
+        if zhy_batch_lock.locked():
+            await msg.reply_text("已有旧三要素批量核验进行中，请稍候。")
             return
 
         chat_id = update.effective_chat.id
-        async with zhy_batch_lock:
-            if len(items) == 1:
-                name, id_card, phone = items[0]
-                async with app.track_request("3ys", f"/3ys {_short_label(name)}"):
-                    progress = await msg.reply_text("⏳ 正在提交中核验旧三要素…")
-                    editor = ProgressEditor(progress)
-                    try:
-                        res = await app.zhy.verify_old_3ys(
-                            name, id_card, phone, on_progress=editor.update
-                        )
-                    except asyncio.CancelledError:
-                        await _mark_cancelled(editor, "🛑 旧三要素核验已手动取消并释放。")
-                        raise
-                    if not res.ok:
-                        await editor.update(f"❌ 旧三要素核验失败：{res.reason}", force=True)
-                        return
-                    chunks = split_text(res.text)
-                    await editor.update(chunks[0], force=True)
-                    for chunk in chunks[1:]:
-                        await context.bot.send_message(chat_id=chat_id, text=chunk)
-                return
-
-            async with app.track_request("3ys", f"/3ys 批量({len(items)}条)"):
-                summary = await msg.reply_text(
-                    f"📦 旧三要素批量核验：共 {len(items)} 条（已去重），逐条执行…"
-                )
-                summary_ed = ProgressEditor(summary, min_interval=1.0)
-                entries: list[tuple[tuple[str, str, str], ZHYResult]] = []
-                ok_cnt = fail_cnt = 0
-                stopped_reason = ""
+        if len(items) == 1:
+            name, id_card, phone = items[0]
+            async with app.track_request("3ys", f"/3ys {_short_label(name)}"):
+                progress = await msg.reply_text("⏳ 正在提交中核验旧三要素…")
+                editor = ProgressEditor(progress)
                 try:
-                    for idx, item in enumerate(items, 1):
-                        if not app.accepting or app.pool.stopping:
-                            stopped_reason = "程序正在关闭"
-                            break
-                        await summary_ed.update(
-                            f"⏳ 旧三要素批量进度：{idx}/{len(items)}（成功 {ok_cnt}，失败 {fail_cnt}）…"
-                        )
-                        res = await app.zhy.verify_old_3ys(*item)
-                        entries.append((item, res))
-                        if res.ok:
-                            ok_cnt += 1
-                        else:
-                            fail_cnt += 1
-                            if res.fatal_batch:
-                                stopped_reason = res.reason
-                                break
+                    res = await app.zhy.verify_old_3ys(
+                        name, id_card, phone, on_progress=editor.update
+                    )
                 except asyncio.CancelledError:
-                    remain = len(items) - len(entries)
-                    await _mark_cancelled(
-                        summary_ed,
-                        f"🛑 旧三要素批量已手动取消并释放：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}",
-                    )
-                    if entries:
-                        report = format_3ys_batch_summary(
-                            entries, total=len(items), stopped_reason="手动取消"
-                        )
-                        for chunk in split_text(report):
-                            try:
-                                await asyncio.wait_for(
-                                    context.bot.send_message(chat_id=chat_id, text=chunk), 2.0
-                                )
-                            except Exception:
-                                break
+                    await _mark_cancelled(editor, "🛑 旧三要素核验已手动取消并释放。")
                     raise
+                if not res.ok:
+                    await editor.update(f"❌ 旧三要素核验失败：{res.reason}", force=True)
+                    return
+                chunks = split_text(res.text)
+                await editor.update(chunks[0], force=True)
+                for chunk in chunks[1:]:
+                    await context.bot.send_message(chat_id=chat_id, text=chunk)
+            return
 
-                remain = len(items) - len(entries)
-                if stopped_reason:
-                    await summary_ed.update(
-                        f"⚠️ 旧三要素批量已提前暂停：成功 {ok_cnt}，失败 {fail_cnt}，未执行 {remain}\n原因：{stopped_reason}",
-                        force=True,
-                    )
-                else:
-                    await summary_ed.update(
-                        f"✅ 旧三要素批量完成：共 {len(items)} 条，成功 {ok_cnt}，失败 {fail_cnt}。",
-                        force=True,
-                    )
+        async with zhy_batch_lock, app.track_request("3ys", f"/3ys 批量({len(items)}条)"):
+            summary = await msg.reply_text(
+                f"📦 旧三要素批量核验：共 {len(items)} 条（已去重），准备并发调度…"
+            )
+            summary_ed = ProgressEditor(summary, min_interval=1.0)
+            try:
+                entries, stopped_reason = await app.zhy.verify_old_3ys_batch(
+                    items,
+                    on_progress=summary_ed.update,
+                    should_stop=lambda: not app.accepting or app.pool.stopping,
+                )
+            except asyncio.CancelledError:
+                await _mark_cancelled(summary_ed, "🛑 旧三要素批量已手动取消并释放。")
+                raise
+
+            match_cnt = sum(1 for _, r in entries if classify_zhy_result(r) == "match")
+            mismatch_cnt = sum(1 for _, r in entries if classify_zhy_result(r) == "mismatch")
+            err_cnt = len(entries) - match_cnt - mismatch_cnt
+            remain = len(items) - len(entries)
+            if stopped_reason:
+                await summary_ed.update(
+                    f"⚠️ 旧三要素批量提前暂停：🟢 {match_cnt} ｜ 🔴 {mismatch_cnt} ｜ 🟡 {err_cnt}（未执行 {remain}）\n原因：{stopped_reason}",
+                    force=True,
+                )
+            else:
+                await summary_ed.update(
+                    f"✅ 旧三要素批量完成（共 {len(items)} 条）：🟢 一致 {match_cnt} ｜ 🔴 不一致 {mismatch_cnt} ｜ 🟡 出错/失败 {err_cnt}",
+                    force=True,
+                )
+            if entries:
                 report = format_3ys_batch_summary(
                     entries, total=len(items), stopped_reason=stopped_reason
                 )
