@@ -97,15 +97,15 @@ def extract_zhy_conclusion(text: str) -> str:
 
 
 def classify_zhy_result(res: ZHYResult) -> str:
-    """归类核验结论：match（一致）/ mismatch（不一致）/ error（出错或失败）。"""
+    """归类核验结论（纯文字判断）：match（一致）/ mismatch（不一致）/ error（出错或失败）。"""
     if not res.ok:
         return "error"
     conclusion = extract_zhy_conclusion(res.text)
-    if any(k in conclusion for k in ("🟡", "🟠", "出错", "失败")):
+    if any(k in conclusion for k in ("出错", "失败", "异常", "重试", "错误")):
         return "error"
-    if "🔴" in conclusion or "不一致" in conclusion:
+    if "不一致" in conclusion:
         return "mismatch"
-    if "🟢" in conclusion or "一致" in conclusion:
+    if "一致" in conclusion:
         return "match"
     return "error"
 

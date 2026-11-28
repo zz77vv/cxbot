@@ -201,6 +201,9 @@ def test_extract_zhy_conclusion_and_classify():
     assert classify_zhy_result(ZHYResult(ok=True, text=raw)) == "mismatch"
     assert classify_zhy_result(ZHYResult(ok=True, text="name: A\n🟢 运营商三要素核验一致")) == "match"
     assert classify_zhy_result(ZHYResult(ok=True, text="name: B\n🟡 核验出错")) == "error"
+    assert classify_zhy_result(ZHYResult(ok=True, text="运营商三要素核验一致")) == "match"
+    assert classify_zhy_result(ZHYResult(ok=True, text="运营商三要素核验不一致\n12306信息核验一致")) == "mismatch"
+    assert classify_zhy_result(ZHYResult(ok=True, text="核验出错")) == "error"
     assert classify_zhy_result(ZHYResult(ok=False, reason="超时")) == "error"
 
 
