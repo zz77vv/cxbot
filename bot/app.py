@@ -160,6 +160,7 @@ class BotApp:
             self._spawn(self.pool.monitor_loop(), name="account-monitor")
             self._spawn(self.login.cleanup_loop(), name="login-cleanup")
             self._spawn(self._cache_purge_loop(), name="cache-purge")
+            self._spawn(self.jr.preverify_loop(), name="jr-preverify")
             log.info("cxbot v3 启动完成，已加载协议号: %d", len(self.pool.accounts))
 
             loop = asyncio.get_running_loop()

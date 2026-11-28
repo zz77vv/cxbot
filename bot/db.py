@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     jr_cooldown_until REAL NOT NULL DEFAULT 0,
     jr_membership TEXT NOT NULL DEFAULT 'unknown' CHECK(jr_membership IN ('unknown', 'free', 'member')),
     jr_membership_checked_at REAL NOT NULL DEFAULT 0,
+    jr_preverify_date TEXT NOT NULL DEFAULT '',
     updated_at REAL NOT NULL DEFAULT 0
 );
 
@@ -122,6 +123,10 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE accounts ADD COLUMN jr_membership_checked_at REAL NOT NULL DEFAULT 0"
             )
+        if "jr_preverify_date" not in cols:
+            await self.conn.execute(
+                "ALTER TABLE accounts ADD COLUMN jr_preverify_date TEXT NOT NULL DEFAULT ''"
+            )
         return self
 
     async def close(self) -> None:
@@ -165,6 +170,7 @@ class Database:
                 "jr_cooldown_until": 0.0,
                 "jr_membership": "unknown",
                 "jr_membership_checked_at": 0.0,
+                "jr_preverify_date": "",
             }
         return dict(row)
 
@@ -227,6 +233,21 @@ class Database:
                     updated_at = excluded.updated_at
                 """,
                 (phone, status, now, now),
+            )
+
+    async def set_jr_preverify_date(self, phone: str, day: str | None = None) -> None:
+        target_day = day or beijing_date()
+        now = time.time()
+        async with self.tx() as c:
+            await c.execute(
+                """
+                INSERT INTO accounts(phone, jr_preverify_date, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(phone) DO UPDATE SET
+                    jr_preverify_date = excluded.jr_preverify_date,
+                    updated_at = excluded.updated_at
+                """,
+                (phone, target_day, now),
             )
 
     # ---------- JR 每日用量 ----------

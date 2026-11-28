@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import random
 import re
 import secrets
 import time
 import unicodedata
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -19,7 +21,7 @@ from telethon.tl.types import KeyboardButtonCallback
 
 from .balance import BalanceService
 from .config import Config
-from .db import CachedResult, Database, make_cache_key
+from .db import BEIJING_TZ, CachedResult, Database, beijing_date, make_cache_key
 from .ocr import OCRError, OCRService, extract_captcha_candidates
 from .targets import (
     JR,
@@ -61,8 +63,24 @@ ACCOUNT_WAIT_TIMEOUT = 180.0
 MEMBERSHIP_RECHECK_INTERVAL = 86400.0
 MANUAL_VERIFY_MAX_ATTEMPTS = 3
 EMPTY_CACHE_SENTINEL = "__JR_EMPTY__"
+JR_PREVERIFY_PROBE = "00000000000"
 
 ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class PreverifyResult:
+    status: str  # passed | already_ok | skipped | cooldown | unavailable | failed | rate_limited
+    reason: str = ""
+
+
+def seconds_until_next_preverify(now: float | None = None, rng: random.Random | None = None) -> float:
+    """计算到下一个北京时间 00:05~00:35 随机预验证窗口的等待秒数。"""
+    cur_ts = time.time() if now is None else now
+    cur_dt = datetime.fromtimestamp(cur_ts, BEIJING_TZ)
+    next_midnight = (cur_dt + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    jitter = (rng or random).uniform(0, 1800)
+    return max(60.0, (next_midnight.timestamp() + jitter) - cur_ts)
 
 
 @dataclass(frozen=True)
@@ -373,6 +391,7 @@ class JRService:
         self.ocr = ocr
         self.manual_verify = manual_verify
         self._query_locks = KeyedLocks()
+        self.preverify_lock = asyncio.Lock()
 
     async def _save_text_file(self, text: str) -> Path:
         self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -942,3 +961,144 @@ class JRService:
                     return JRResult(ok=False, kind="error", reason=f"查询发生异常（{type(exc).__name__}）。")
 
             return JRResult(ok=False, kind="error", reason="多次尝试换号仍未成功，请稍后再试。")
+
+    async def preverify_account(self, account: Account, *, force: bool = False) -> PreverifyResult:
+        """对单个协议号执行纯自动 OCR 预过巨人安全验证（不弹私聊、通过即停手不重发查询）。"""
+        today = beijing_date()
+        meta = await self.db.get_account_meta(account.phone)
+        if not force and meta.get("jr_preverify_date") == today:
+            return PreverifyResult("skipped", "今日已预验")
+        if account.flood_until > time.time():
+            return PreverifyResult("unavailable", "电报限流冷却中")
+        if float(meta.get("jr_cooldown_until") or 0.0) > time.time():
+            return PreverifyResult("cooldown", "巨人查询冷却中")
+
+        try:
+            async with self.pool.hold_account(account, wait=False) as client:
+                async with self.pool.rpc_slot():
+                    sent = await asyncio.wait_for(
+                        client.send_message(JR.username, JR_PREVERIFY_PROBE),
+                        self.cfg.reply_timeout,
+                    )
+                reply = await wait_reply(
+                    client,
+                    JR.username,
+                    sent.id,
+                    lambda m: not is_pending_message(m),
+                    self.cfg.reply_timeout,
+                    rpc_timeout=self.cfg.reply_timeout,
+                )
+                if reply is None:
+                    return PreverifyResult("failed", "等待回复超时")
+
+                cd = parse_cooldown_seconds(reply)
+                if cd is not None:
+                    await self.db.set_jr_cooldown(account.phone, time.time() + cd)
+                    return PreverifyResult("cooldown", f"巨人冷却({cd}s)")
+
+                if classify_message(reply) != "manual":
+                    await self.db.set_jr_preverify_date(account.phone, today)
+                    return PreverifyResult("already_ok", "当前免验")
+
+                msg = reply
+                for attempt in range(1, OCR_MAX_ATTEMPTS + 1):
+                    cands = extract_captcha_candidates(msg)
+                    if not cands or not getattr(msg, "media", None):
+                        return PreverifyResult("failed", "验证码按钮异常")
+                    async with self.pool.rpc_slot():
+                        img_bytes = await asyncio.wait_for(
+                            client.download_media(msg, file=bytes), self.cfg.reply_timeout
+                        )
+                    if not isinstance(img_bytes, bytes) or not img_bytes:
+                        return PreverifyResult("failed", "下载验证码失败")
+                    try:
+                        btn_idx, _, _ = await self.ocr.recognize_captcha(
+                            img_bytes, [c.normalized for c in cands]
+                        )
+                    except OCRError as exc:
+                        return PreverifyResult("failed", f"OCR未识别({exc.code})")
+
+                    chosen = cands[btn_idx]
+                    old_sig = msg_signature(msg)
+                    async with self.pool.rpc_slot():
+                        cb = await asyncio.wait_for(
+                            msg.click(chosen.row, chosen.col), self.cfg.reply_timeout
+                        )
+                        passed = "验证通过" in (getattr(cb, "message", "") or "")
+                        next_msg = None
+                        if not passed:
+                            next_msg = await wait_reply(
+                                client,
+                                JR.username,
+                                msg.id,
+                                lambda m: not is_pending_message(m),
+                                self.cfg.reply_timeout,
+                                original=msg,
+                                old_sig=old_sig,
+                                rpc_timeout=self.cfg.reply_timeout,
+                            )
+                            passed = bool(next_msg and "验证通过" in (getattr(next_msg, "text", "") or ""))
+                    if passed:
+                        # 验证通过即止步，不重发探测词，避免白扣额度或积分
+                        await self.db.set_jr_preverify_date(account.phone, today)
+                        return PreverifyResult("passed", "自动OCR通过")
+                    if next_msg is not None and classify_message(next_msg) == "manual":
+                        msg = next_msg
+                        continue
+                    return PreverifyResult("failed", f"第{attempt}轮验证未通过")
+
+                return PreverifyResult("failed", "多次OCR未通过")
+        except AccountUnavailable:
+            return PreverifyResult("unavailable", "账号不可用或忙碌")
+        except FloodWaitError as exc:
+            return PreverifyResult("rate_limited", f"触发限流({exc.seconds}s)")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("巨人预验证异常 phone=%s", account.phone, exc_info=exc)
+            return PreverifyResult("failed", f"异常({type(exc).__name__})")
+
+    async def preverify_all(
+        self,
+        *,
+        force: bool = False,
+        on_progress: ProgressCallback | None = None,
+        stagger: bool = False,
+    ) -> list[tuple[str, PreverifyResult]]:
+        """批量预过所有账号巨人安全验证。"""
+        async with self.preverify_lock:
+            accounts = tuple(self.pool.accounts.values())
+            results: list[tuple[str, PreverifyResult]] = []
+            for idx, acc in enumerate(accounts, 1):
+                if self.pool.stopping:
+                    break
+                if on_progress:
+                    await on_progress(f"🔐 正在预验证 [{idx}/{len(accounts)}] 尾号 {acc.phone[-4:]}…")
+                res = await self.preverify_account(acc, force=force)
+                results.append((acc.phone, res))
+                if res.status == "rate_limited":
+                    break
+                if idx < len(accounts) and res.status not in ("skipped", "unavailable"):
+                    delay = random.uniform(3.0, 10.0) if stagger else random.uniform(1.0, 2.0)
+                    await asyncio.sleep(delay)
+            return results
+
+    async def preverify_loop(self) -> None:
+        """每天北京时间 00:05~00:35 自动错峰预过巨人验证。"""
+        while not self.pool.stopping:
+            try:
+                delay = seconds_until_next_preverify()
+                log.info("巨人每日自动预验证已调度，约 %.1f 分钟后执行", delay / 60.0)
+                await asyncio.sleep(delay)
+                if self.pool.stopping:
+                    break
+                results = await self.preverify_all(force=False, stagger=True)
+                passed = sum(1 for _, r in results if r.status == "passed")
+                ok = sum(1 for _, r in results if r.status == "already_ok")
+                failed = sum(1 for _, r in results if r.status == "failed")
+                log.info("巨人每日自动预验证完成：通过 %d，免验 %d，失败 %d，总计 %d", passed, ok, failed, len(results))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("巨人每日自动预验证循环异常", exc_info=exc)
+                await asyncio.sleep(300)

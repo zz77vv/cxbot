@@ -33,6 +33,7 @@ COMMANDS = {
     "start": "显示管理员菜单",
     "help": "显示使用帮助",
     "jr": "巨人查询（支持 /jr+内容 与多行批量）",
+    "jrpre": "手动预过全账号巨人验证（可加 force 强制）",
     "hw": "核武器私聊查询（支持多行批量）",
     "3ys": "中核验旧三要素（支持多行批量汇总）",
     "qd": "手动触发全账号签到",
@@ -438,6 +439,43 @@ def register_handlers(application: Application, app) -> None:
             lines.append(f"• {req.label}（已运行 {elapsed}s）")
         await send_long(msg, "\n".join(lines))
 
+    async def on_jrpre(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        if app.jr.preverify_lock.locked():
+            await msg.reply_text("已有巨人预验证正在进行，请稍候。")
+            return
+        parts = (msg.text or "").split(maxsplit=1)
+        arg = parts[1].strip().casefold() if len(parts) == 2 else ""
+        force = arg in {"force", "all", "强制", "-f"}
+
+        pre_labels = {
+            "passed": "✅ 自动OCR通过",
+            "already_ok": "🟢 当前免验",
+            "skipped": "⏭ 今日已预验",
+            "cooldown": "🟡 冷却中",
+            "unavailable": "⚪ 不可用",
+            "failed": "❌ 失败",
+            "rate_limited": "🔴 限流",
+        }
+        async with app.track_request("jrpre", "/jrpre 巨人预验证"):
+            progress = await msg.reply_text(
+                f"🔐 开始预过全账号巨人验证（{'强制全跑' if force else '跳过今日已预验'}）…"
+            )
+            editor = ProgressEditor(progress)
+            try:
+                results = await app.jr.preverify_all(force=force, on_progress=editor.update)
+            except asyncio.CancelledError:
+                await _mark_cancelled(editor, "🛑 巨人预验证已手动取消并释放。")
+                raise
+            if not results:
+                await editor.update("暂无已登录协议号。", force=True)
+                return
+            lines = ["🔐 巨人预验证汇总"]
+            for phone, r in results:
+                label = pre_labels.get(r.status, r.status)
+                lines.append(f"• {phone}：{label}（{r.reason}）")
+            await _deliver_text(update.effective_chat.id, context.bot, editor, "\n".join(lines))
+
     async def on_3ys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = update.effective_message
         parts = (msg.text or "").split(maxsplit=1)
@@ -576,6 +614,7 @@ def register_handlers(application: Application, app) -> None:
     application.add_handler(CommandHandler("qd", on_checkin))
     application.add_handler(CommandHandler("jf", on_balance))
     application.add_handler(CommandHandler("hw", on_hw))
+    application.add_handler(CommandHandler("jrpre", on_jrpre))
     application.add_handler(CommandHandler("3ys", on_3ys))
     application.add_handler(CommandHandler("login", on_login))
     application.add_handler(CommandHandler("cancel", on_cancel))

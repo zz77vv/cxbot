@@ -248,3 +248,87 @@ async def test_jr_three_empty_result_formats_with_pre_entity_and_url_buttons(tmp
         assert client.send_message.await_count == 4
     finally:
         await db.close()
+
+
+async def test_jr_preverify_passes_ocr_without_resubmitting_and_skips_same_day(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        verify_msg = _msg(2, "安全验证，请点击下图", buttons=[[_btn("甲"), _btn("乙")]], media=object())
+        verify_msg.click = AsyncMock(return_value=SimpleNamespace(message="验证通过"))
+        client = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(return_value=_msg(1, "00000000000", out=True)),
+            get_messages=AsyncMock(return_value=[verify_msg]),
+            download_media=AsyncMock(return_value=b"fake-img"),
+        )
+        pool = UserbotPool(cfg, db)
+        acc = Account("10001", tmp_path / "1.session", client, AccountState.ONLINE)
+        pool.accounts["10001"] = acc
+
+        ocr = SimpleNamespace(recognize_captcha=AsyncMock(return_value=(1, "乙", 0.95)))
+        jr = JRService(cfg, db, pool, SimpleNamespace(), ocr, ManualVerifyManager(cfg))
+
+        r1 = await jr.preverify_account(acc)
+        assert r1.status == "passed"
+        # 验证通过后绝不重发探测词，只发过 1 条探测消息
+        assert client.send_message.await_count == 1
+        verify_msg.click.assert_awaited_once()
+
+        # 同一天再次运行应自动跳过
+        r2 = await jr.preverify_account(acc)
+        assert r2.status == "skipped"
+        assert client.send_message.await_count == 1
+    finally:
+        await db.close()
+
+
+async def test_jr_preverify_already_ok_and_ocr_failure_does_not_prompt_manual(tmp_path):
+    cfg = _make_cfg(tmp_path)
+    db = await Database(cfg.database).open()
+    try:
+        ok_reply = _msg(2, "抱歉，未找到相关信息。")
+        c1 = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(return_value=_msg(1, "00000000000", out=True)),
+            get_messages=AsyncMock(return_value=[ok_reply]),
+        )
+        verify_msg = _msg(12, "安全验证，请点击下图", buttons=[[_btn("甲"), _btn("乙")]], media=object())
+        c2 = SimpleNamespace(
+            is_connected=lambda: True,
+            send_message=AsyncMock(return_value=_msg(11, "00000000000", out=True)),
+            get_messages=AsyncMock(return_value=[verify_msg]),
+            download_media=AsyncMock(return_value=b"fake-img"),
+        )
+        pool = UserbotPool(cfg, db)
+        a1 = Account("10001", tmp_path / "1.session", c1, AccountState.ONLINE)
+        a2 = Account("10002", tmp_path / "2.session", c2, AccountState.ONLINE)
+        pool.accounts["10001"] = a1
+        pool.accounts["10002"] = a2
+
+        manual = ManualVerifyManager(cfg)
+        manual.ask_admin = AsyncMock()
+        ocr = SimpleNamespace(recognize_captcha=AsyncMock(side_effect=OCRError("LowConfidence")))
+        jr = JRService(cfg, db, pool, SimpleNamespace(), ocr, manual)
+
+        r1 = await jr.preverify_account(a1)
+        r2 = await jr.preverify_account(a2)
+        assert r1.status == "already_ok"
+        assert r2.status == "failed"
+        manual.ask_admin.assert_not_called()
+    finally:
+        await db.close()
+
+
+def test_seconds_until_next_preverify_targets_beijing_window():
+    import random
+    from datetime import datetime
+    from bot.db import BEIJING_TZ
+    from bot.jr import seconds_until_next_preverify
+
+    # 2026-11-29 00:10:00 北京时间 -> 下一次应落在 2026-11-30 00:05~00:35
+    now_dt = datetime(2026, 11, 29, 0, 10, 0, tzinfo=BEIJING_TZ)
+    delay = seconds_until_next_preverify(now_dt.timestamp(), random.Random(42))
+    target_dt = datetime.fromtimestamp(now_dt.timestamp() + delay, BEIJING_TZ)
+    assert target_dt.date().isoformat() == "2026-11-30"
+    assert target_dt.hour == 0 and 5 <= target_dt.minute <= 35
